@@ -1,0 +1,40 @@
+# Accelerate FSDP2 + KTransformers Configuration
+# GLM-4.5-Air full fine-tuning test, 4 GPU, AMX INT8 expert backend.
+#
+# Intended hardware target:
+#   - 4 x RTX 4090-class GPU
+#   - dual-socket CPU / 2 NUMA nodes for AMX INT8 expert execution
+#
+# FSDP shards the GPU-resident non-expert weights across 4 ranks. KT keeps
+# routed expert execution on CPU through AMX INT8.
+#
+# Usage:
+#   USE_KT=1 ACCELERATE_USE_KT=true ACCELERATE_KT_TRAIN_MODE=full accelerate launch \
+#     --config_file configs/accelerate_fft_amxint8_4gpu.yaml \
+#     -m llamafactory.cli train configs/train_full_ft_glm45_air.yaml
+
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+fsdp_config:
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_cpu_ram_efficient_loading: true
+  fsdp_offload_params: false
+  fsdp_reshard_after_forward: true
+  fsdp_state_dict_type: FULL_STATE_DICT
+  fsdp_version: 2
+mixed_precision: bf16
+num_machines: 1
+num_processes: 4
+rdzv_backend: static
+same_network: true
+use_cpu: false
+
+kt_config:
+  enabled: true
+  kt_backend: AMXINT8
+  kt_num_threads: 96
+  kt_tp_enabled: true
+  kt_threadpool_count: 2
+  kt_max_cache_depth: 2
+  kt_model_max_length: 1024
+  kt_share_backward_bb: true

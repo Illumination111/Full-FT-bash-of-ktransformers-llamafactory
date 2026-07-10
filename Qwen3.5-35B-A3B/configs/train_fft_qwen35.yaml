@@ -1,0 +1,60 @@
+# Qwen3.5-35B-A3B 全量微调（FFT）训练配置
+# KTransformers 后端，finetuning_type=full → kt_train_mode=full
+#
+# 注意：output_dir 在 run_fft_test.sh 中由 sed 动态替换为带时间戳的路径
+# 注意：此配置作为基础模板；各 Phase 的特定参数（gradient_accumulation_steps, save_steps 等）
+#       由 run_fft_test.sh 通过临时副本覆盖。
+
+### model
+model_name_or_path: /mnt/data2/models/Qwen3.5-35B-A3B-Unfused
+trust_remote_code: true
+# 冻结视觉编码器，只训练语言模型部分（纯文本 SFT）
+freeze_vision_tower: true
+freeze_multi_modal_projector: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+# full 模式下 lora_rank/lora_target 无效，不设置
+
+### dataset
+dataset: identity,alpaca_en_demo
+template: qwen3_5
+cutoff_len: 1024          # Must be >= max actual tokenized length including template overhead
+                          # qwen3/qwen3_5 template + identity dataset can produce 840+ tokens
+max_samples: 80           # 80 条样本足以覆盖多个 step
+overwrite_cache: true
+preprocessing_num_workers: 8
+dataloader_num_workers: 2
+
+### output
+# output_dir 由 run_fft_test.sh 动态替换；此处为占位符
+output_dir: /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/test_log/PLACEHOLDER
+logging_steps: 1          # 每步记录，便于捕获细粒度指标
+save_steps: 500           # 默认不频繁保存；Phase 3 会将此覆盖为 2
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: false    # 保存完整 checkpoint（含 optimizer state），测试保存吞吐
+report_to: none
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1    # Phase 2 会覆盖为 4
+learning_rate: 1.0e-5             # full 模式学习率比 LoRA 小一个数量级
+num_train_epochs: 3.0             # 跑多轮以观察稳定性；max_steps 会提前截断
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+# max_steps 由 run_fft_test.sh 根据 Phase 动态注入；不设此处默认值
+
+# 超时设置：full 模式反向传播极慢，需增大超时
+ddp_timeout: 360000000
+resume_from_checkpoint: null
+
+# 梯度裁剪：监控梯度范数
+max_grad_norm: 1.0
+
+### ktransformers
+use_kt: true
+kt_weight_path: /mnt/data2/models/Qwen3.5-35B-A3B-AMXINT4-NUMA2-MESH

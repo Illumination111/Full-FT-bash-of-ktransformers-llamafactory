@@ -1,0 +1,15 @@
+# Test records / run outputs
+**/test_log/
+test_log/
+
+# Python cache
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

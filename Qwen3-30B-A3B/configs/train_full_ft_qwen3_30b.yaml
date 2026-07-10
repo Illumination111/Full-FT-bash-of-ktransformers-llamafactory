@@ -1,0 +1,63 @@
+# Qwen3-30B-A3B REAL Full Fine-Tuning (FFT) Training Configuration
+# KTransformers backend, finetuning_type=full + ACCELERATE_KT_TRAIN_MODE=full
+#   -> kt_full_weight_grad=True  (true full-weight expert gradients, NOT LoRA)
+#
+# Note: output_dir is dynamically replaced by run_full_ft_test.sh with a
+#       timestamped path. This config is a base template; phase-specific
+#       parameters (max_steps, gradient_accumulation_steps, ...) are injected
+#       per phase via temporary copies.
+
+### model
+model_name_or_path: /mnt/data3/models/Qwen3-30B-A3B
+trust_remote_code: true
+# Pure text MoE model -- no vision tower, no Conv3d, no multimodal projector
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+# full mode: lora_rank/lora_target are not applicable
+# Real full FT is gated by env ACCELERATE_KT_TRAIN_MODE=full (set by the runner)
+
+### dataset
+dataset: fft_real_100
+dataset_dir: /mnt/data2/wbw/FFTtest/dataset
+template: qwen3
+cutoff_len: 1024          # Every sample tokenizes to >7000 tokens, so each step
+                          # is truncated to EXACTLY 1024 real tokens (no padding)
+max_samples: 100          # 100 stress samples; all hit cutoff_len for accurate TPS
+overwrite_cache: true
+preprocessing_num_workers: 8
+dataloader_num_workers: 2
+
+### output
+# output_dir is dynamically replaced by run_full_ft_test.sh; this is a placeholder
+output_dir: /mnt/data2/wbw/FFTtest/Qwen3-30B-A3B/test_log/PLACEHOLDER
+logging_steps: 1
+save_steps: 500
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: true
+report_to: none
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 1.0e-5             # Full fine-tuning LR, one order smaller than LoRA
+num_train_epochs: 3.0             # Multi-epoch to observe stability; max_steps truncates early
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+# max_steps is dynamically injected per phase by run_full_ft_test.sh
+
+# Timeout: full-mode backward is much slower, need large timeout
+ddp_timeout: 360000000
+resume_from_checkpoint: null
+
+# Gradient clipping: monitor gradient norms
+max_grad_norm: 1.0
+
+### ktransformers
+use_kt: true
+# AMXBF16 backend reads native BF16 safetensors directly — no pre-conversion required
+kt_weight_path: /mnt/data3/models/Qwen3-30B-A3B

@@ -1,0 +1,38 @@
+# Accelerate FSDP2 + KTransformers Configuration
+# For Qwen3-30B-A3B Full Fine-Tuning (FFT) — Dual GPU, AMX BF16, 2 NUMA (OOM Fallback)
+#
+# Backend: AMXBF16 (reads original HF BF16 safetensors directly, no pre-conversion needed)
+# CPU layout: 2 NUMA nodes × 48 threads (kt_tp_enabled partitions MoE across NUMA)
+# GPU count: 2 x RTX 4090 (24 GB each)
+#
+# This config is the automatic OOM fallback when single-GPU runs out of VRAM.
+#
+# Usage:
+#   USE_KT=1 ACCELERATE_USE_KT=true ACCELERATE_KT_TRAIN_MODE=full accelerate launch \
+#     --config_file configs/accelerate_fft_amxbf16_2gpu.yaml \
+#     -m llamafactory.cli train configs/train_full_ft_qwen3_30b.yaml
+
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+fsdp_config:
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_cpu_ram_efficient_loading: true
+  fsdp_offload_params: false
+  fsdp_reshard_after_forward: true    # Reshard across 2 GPUs to halve per-device peak memory
+  fsdp_state_dict_type: FULL_STATE_DICT
+  fsdp_version: 2
+mixed_precision: bf16
+num_machines: 1
+num_processes: 2
+rdzv_backend: static
+same_network: true
+use_cpu: false
+
+kt_config:
+  enabled: true
+  kt_backend: AMXBF16
+  kt_num_threads: 96              # 48 threads per NUMA node (2 × 48)
+  kt_tp_enabled: true             # CPU tensor-parallel across 2 NUMA nodes
+  kt_threadpool_count: 2
+  kt_max_cache_depth: 2
+  kt_share_backward_bb: true

@@ -1,0 +1,62 @@
+# GLM-4.5-Air REAL Full Fine-Tuning test configuration
+# KTransformers backend, finetuning_type=full + ACCELERATE_KT_TRAIN_MODE=full
+#   -> kt_full_weight_grad=True, i.e. full expert/base-weight gradients.
+#
+# Parameters intentionally fixed for memory/TPS comparability with the Qwen test:
+#   - per_device_train_batch_size: 1
+#   - cutoff_len: 1024
+#   - bf16: true
+#   - optimizer: adamw_torch
+#   - gradient checkpointing enabled via disable_gradient_checkpointing=false
+#
+# Parameters that are not GLM-specific tuned:
+#   - learning_rate=1e-5, lr_scheduler_type=cosine, warmup_ratio=0.1 follow the
+#     Qwen full-FT baseline and are meant for stress testing, not final quality.
+#   - max_steps, gradient_accumulation_steps, save_strategy and logging_steps are
+#     overwritten per phase by run_full_ft_test_1gpu_bf16.sh.
+
+### model
+model_name_or_path: /mnt/data3/models/GLM-4.5-Air
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+
+### dataset
+dataset: fft_real_100
+dataset_dir: /mnt/data2/wbw/FFTtest/dataset
+template: glm4_moe
+cutoff_len: 1024
+max_samples: 100
+overwrite_cache: true
+preprocessing_num_workers: 8
+dataloader_num_workers: 2
+
+### output
+output_dir: /mnt/data2/wbw/FFTtest/GLM-4.5-Air/test_log/PLACEHOLDER
+logging_steps: 1
+save_steps: 500
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: true
+report_to: none
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 1.0e-5
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+optim: adamw_torch
+disable_gradient_checkpointing: false
+ddp_timeout: 360000000
+resume_from_checkpoint: null
+max_grad_norm: 1.0
+
+### ktransformers
+use_kt: true
+kt_weight_path: /mnt/data3/models/GLM-4.5-Air

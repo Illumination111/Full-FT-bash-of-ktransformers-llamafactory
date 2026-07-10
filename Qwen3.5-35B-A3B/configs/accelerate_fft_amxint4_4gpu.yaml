@@ -1,0 +1,38 @@
+# Accelerate FSDP2 + KTransformers 配置
+# 用于 Qwen3.5-35B-A3B 全量微调（FFT）
+# 对应后端：AMXINT4（使用预转换量化权重）
+# GPU 数量：4（可按需修改 num_processes）
+#
+# 使用方式:
+#   USE_KT=1 ACCELERATE_USE_KT=true accelerate launch \
+#     --config_file configs/accelerate_fft_amxint4_4gpu.yaml \
+#     -m llamafactory.cli train configs/train_fft_qwen35.yaml
+
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+fsdp_config:
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_cpu_ram_efficient_loading: true
+  fsdp_offload_params: false
+  fsdp_reshard_after_forward: true
+  # FULL_STATE_DICT 会触发完整权重聚合后保存（~61 GB expert 权重），用于测试 P3 磁盘吞吐
+  fsdp_state_dict_type: FULL_STATE_DICT
+  fsdp_version: 2
+mixed_precision: bf16
+num_machines: 1
+num_processes: 4  # 使用 4 张 RTX 4090；系统共 8 张，可调整
+rdzv_backend: static
+same_network: true
+use_cpu: false
+
+kt_config:
+  enabled: true
+  # AMXINT4 对应 /mnt/data2/models/Qwen3.5-35B-A3B-AMXINT4-NUMA2-MESH 量化权重
+  kt_backend: AMXINT4
+  kt_num_threads: 96
+  kt_tp_enabled: true
+  kt_threadpool_count: 2
+  kt_max_cache_depth: 2
+  kt_share_backward_bb: true
+  # full 模式下 lora_rank 自动设为 0，此处不设置
+  # lora_rank: 0
