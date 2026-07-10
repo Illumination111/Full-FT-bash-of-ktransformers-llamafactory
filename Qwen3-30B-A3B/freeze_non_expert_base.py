@@ -3,6 +3,10 @@
 Ablation for Full-FT: if only expert base is trainable and loss stays flat,
 that supports the diagnosis that base-weight grads are not written (e.g.
 full_weight_grad lost in TP object slicing).
+
+Compatible with both:
+  - older kt-kernel that exposes _collect_kt_full_weight_params / _collect_kt_lora_params
+  - current kt-kernel that only exposes get_kt_trainable_params / get_kt_lora_params
 """
 
 from __future__ import annotations
@@ -24,21 +28,62 @@ def _unwrap(model):
         return model
 
 
-def _collect_expert_base(model) -> list:
-    from kt_kernel.sft.lora import _collect_kt_full_weight_params, _find_kt_wrappers
+def _collect_full_weight_from_wrappers(wrappers) -> list:
+    """Fallback when _collect_kt_full_weight_params is absent (current kt-kernel)."""
+    params: list = []
+    for wrapper in wrappers or []:
+        if not getattr(wrapper, "_full_weight_grad", False):
+            continue
+        inner = getattr(wrapper, "wrapper", None)
+        if inner is None:
+            continue
+        for name in ("gate_proj_buf", "up_proj_buf", "down_proj_buf"):
+            buf = getattr(inner, name, None)
+            if buf is not None:
+                params.append(buf)
+    return params
 
-    wrappers = _find_kt_wrappers(model) or []
-    params = _collect_kt_full_weight_params(wrappers)
+
+def _collect_expert_base(model) -> list:
+    import kt_kernel.sft.lora as kt_lora
+
+    wrappers = kt_lora._find_kt_wrappers(model) or []
+    collect = getattr(kt_lora, "_collect_kt_full_weight_params", None)
+    if collect is not None:
+        params = collect(wrappers)
+    else:
+        # Prefer public API; strip hybrid LoRA extras so ablation stays expert-base-only.
+        get_trainable = getattr(kt_lora, "get_kt_trainable_params", None)
+        if get_trainable is not None:
+            all_params = get_trainable(model) or []
+            lora_params = set()
+            get_lora = getattr(kt_lora, "get_kt_lora_params", None)
+            if get_lora is not None:
+                lora_params = set(id(p) for p in (get_lora(model) or []))
+            params = [p for p in all_params if id(p) not in lora_params]
+            # If filtering emptied the list (unexpected), fall back to wrapper scan.
+            if not params:
+                params = _collect_full_weight_from_wrappers(wrappers)
+        else:
+            params = _collect_full_weight_from_wrappers(wrappers)
+
     for p in params:
         p.requires_grad_(True)
     return params
 
 
 def _collect_kt_lora(model) -> list:
-    from kt_kernel.sft.lora import _collect_kt_lora_params, _find_kt_wrappers
+    import kt_kernel.sft.lora as kt_lora
 
-    wrappers = _find_kt_wrappers(model) or []
-    return _collect_kt_lora_params(wrappers)
+    collect = getattr(kt_lora, "_collect_kt_lora_params", None)
+    if collect is not None:
+        wrappers = kt_lora._find_kt_wrappers(model) or []
+        return collect(wrappers)
+
+    get_lora = getattr(kt_lora, "get_kt_lora_params", None)
+    if get_lora is not None:
+        return get_lora(model) or []
+    return []
 
 
 def _freeze_all_named(model) -> tuple[int, int]:
@@ -147,7 +192,13 @@ def install_freeze() -> None:
                     flush=True,
                 )
                 return []
-            params = kt_lora._collect_kt_full_weight_params(wrappers)
+
+            collect = getattr(kt_lora, "_collect_kt_full_weight_params", None)
+            if collect is not None:
+                params = collect(wrappers)
+            else:
+                params = _collect_full_weight_from_wrappers(wrappers)
+
             for p in params:
                 p.requires_grad_(True)
             print(
