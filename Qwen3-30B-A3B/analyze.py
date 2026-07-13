@@ -970,13 +970,16 @@ def generate_summary_md(
         tl = trainer_logs.get(ph, {})
         if tl.get("nan_lines"):
             p5_results.append(f"{ph}(行:{tl['nan_lines'][:3]})")
-        ec = exit_codes.get(ph)
-        if ec and ec < 0:
-            log_f = log_dir / ph / "train.log"
-            if log_f.exists() and re.search(
-                r"sigsegv|segfault|core dump", log_f.read_text(errors="replace"), re.IGNORECASE
-            ):
-                p5_results.append(f"{ph}:SIGSEGV")
+        # The phase exit-code file contains the outer accelerate launcher status
+        # (usually 1), while torch elastic records the crashed child as -11 in
+        # train.log.  Detect SIGSEGV from the raw log regardless of launcher code.
+        log_f = log_dir / ph / "train.log"
+        if log_f.exists() and re.search(
+            r"sigsegv|segfault|segmentation fault|signal\s+11|core dump(?:ed)?",
+            log_f.read_text(errors="replace"),
+            re.IGNORECASE,
+        ):
+            p5_results.append(f"{ph}:SIGSEGV")
     p5_result = "、".join(p5_results) if p5_results else "✓ 未检测到 NaN/Inf/崩溃"
     if p5_results:
         p5_result = "⚠ " + p5_result
@@ -1051,7 +1054,35 @@ def generate_summary_md(
     else:
         lines.append("- 无 `stall_events.json`（需 `KT_STALL_WATCH=1`）")
 
-    lines += ["", "---", "", "## 6. Expert 基座权重变化检查", ""]
+    lines += ["", "---", "", "## 6. Expert 梯度与基座权重检查", ""]
+    lines += ["### 6.1 optimizer 前专家梯度", ""]
+    lines.append("- 方法: 完整扫描每层 `grad_gate/up/down_proj_buf` 及对应 `Parameter.grad`")
+    lines.append(f"- 文本报告: `{log_dir / 'expert_gradient_check.txt'}`")
+    lines.append(f"- JSON 报告: `{log_dir / 'expert_gradient_check.json'}`")
+    lines.append(f"- 原始 probe: `{log_dir / 'phase4' / 'expert_grad_probe.json'}`")
+    grad_report = log_dir / "expert_gradient_check.json"
+    if grad_report.exists():
+        try:
+            grad_data = json.loads(grad_report.read_text())
+            lines.append(f"- 状态: **{grad_data.get('status', 'UNKNOWN')}**")
+            if grad_data.get("reason"):
+                lines.append(f"- 原因: {grad_data['reason']}")
+            for step in grad_data.get("steps") or []:
+                grad_summary = step.get("summary") or {}
+                lines.append(
+                    f"- Step {step.get('optimizer_step')}: LR={step.get('learning_rates', [])}，"
+                    f"非零 C++ buffer={grad_summary.get('nonzero_grad_buffers', 0)}/"
+                    f"{grad_summary.get('ok_records', 0)}，"
+                    f"非零 Parameter.grad={grad_summary.get('nonzero_parameter_grads', 0)}/"
+                    f"{grad_summary.get('ok_records', 0)}，"
+                    f"非有限={grad_summary.get('nonfinite_grad_buffers', 0) + grad_summary.get('nonfinite_parameter_grads', 0)}"
+                )
+        except Exception as exc:
+            lines.append(f"- 解析失败: {exc}")
+    else:
+        lines.append("- （未运行 expert 梯度检查）")
+
+    lines += ["", "### 6.2 Expert 基座权重变化", ""]
     lines.append("- 方法: 训练中采样 KT `gate/up/down_proj_buf`（非 HF checkpoint）")
     lines.append(f"- 文本报告: `{log_dir / 'expert_weight_change_check.txt'}`")
     lines.append(f"- JSON 报告: `{log_dir / 'expert_weight_change_check.json'}`")

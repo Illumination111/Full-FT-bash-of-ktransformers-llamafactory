@@ -31,7 +31,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 # --------------------------------------------------------------------------- #
@@ -399,7 +399,7 @@ class Monitor:
 
     def _sample_once(self, dt: float) -> dict:
         del dt  # 保留签名兼容
-        now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        now = datetime.now().astimezone().isoformat(timespec="milliseconds")
         elapsed = time.time() - self._start_time
 
         cpu_util = psutil.cpu_percent(interval=None)

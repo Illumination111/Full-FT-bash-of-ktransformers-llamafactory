@@ -30,6 +30,13 @@ def _env_float(name: str, default: float) -> float:
     return float(raw)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw in ("1", "true", "TRUE", "yes", "YES")
+
+
 def _find_kt_wrappers(model: torch.nn.Module):
     try:
         from kt_kernel.sft.lora import _find_kt_wrappers as _kt_find
@@ -64,6 +71,53 @@ def _buf_map(inner) -> dict[str, torch.Tensor]:
     if getattr(inner, "down_proj_buf", None) is not None:
         out["down_proj"] = inner.down_proj_buf.data
     return out
+
+
+def _grad_buf_map(inner) -> dict[str, torch.Tensor]:
+    out = {}
+    if getattr(inner, "grad_gate_proj_buf", None) is not None:
+        out["gate_proj"] = inner.grad_gate_proj_buf
+    if getattr(inner, "grad_up_proj_buf", None) is not None:
+        out["up_proj"] = inner.grad_up_proj_buf
+    if getattr(inner, "grad_down_proj_buf", None) is not None:
+        out["down_proj"] = inner.grad_down_proj_buf
+    return out
+
+
+def _scan_grad_tensor(t: torch.Tensor, chunk_elems: int) -> dict[str, Any]:
+    """Scan a potentially huge CPU gradient without materializing an FP32 copy."""
+    x = t.detach()
+    flat = x.reshape(-1)
+    numel = int(flat.numel())
+    nonzero = 0
+    finite_elems = 0
+    max_abs = 0.0
+
+    with torch.no_grad():
+        for start in range(0, numel, chunk_elems):
+            chunk = flat[start : start + chunk_elems]
+            finite_mask = torch.isfinite(chunk)
+            chunk_finite = int(torch.count_nonzero(finite_mask).item())
+            finite_elems += chunk_finite
+            nonzero += int(torch.count_nonzero(chunk).item())
+            if chunk_finite == int(chunk.numel()) and chunk.numel():
+                max_abs = max(max_abs, float(chunk.abs().max().item()))
+
+    finite = finite_elems == numel
+    return {
+        "present": True,
+        "shape": list(x.shape),
+        "dtype": str(x.dtype),
+        "device": str(x.device),
+        "numel": numel,
+        "finite": finite,
+        "finite_elements": finite_elems,
+        "nonfinite_elements": numel - finite_elems,
+        "nonzero_elements": nonzero,
+        "nonzero_fraction": nonzero / max(numel, 1),
+        "max_abs": max_abs if finite else None,
+        "data_ptr": int(x.data_ptr()),
+    }
 
 
 def _tensor_stats(t: torch.Tensor) -> dict[str, float | bool | int]:
@@ -135,13 +189,21 @@ class ExpertBufProbeCallback(TrainerCallback):
         self.sample_n = _env_int("KT_EXPERT_BUF_PROBE_SAMPLES", 12)
         self.seed = _env_int("KT_EXPERT_BUF_PROBE_SEED", 20260709)
         self.atol = _env_float("KT_EXPERT_BUF_PROBE_ATOL", 0.0)
+        self.grad_probe_enabled = _env_bool("KT_EXPERT_GRAD_PROBE", True)
+        default_grad_path = self.out_path.with_name("expert_grad_probe.json")
+        self.grad_out_path = Path(os.environ.get("KT_EXPERT_GRAD_PROBE_OUT", str(default_grad_path)))
+        self.grad_scan_chunk_elems = max(1, _env_int("KT_EXPERT_GRAD_SCAN_CHUNK_ELEMS", 8 * 1024 * 1024))
         self.baseline: dict[str, torch.Tensor] = {}
         self.targets: list[tuple[int, int, str]] = []
+        self.gradient_steps: list[dict[str, Any]] = []
         self.meta: dict[str, Any] = {
             "sample_n": self.sample_n,
             "seed": self.seed,
             "atol": self.atol,
             "out_path": str(self.out_path),
+            "grad_probe_enabled": self.grad_probe_enabled,
+            "grad_out_path": str(self.grad_out_path),
+            "grad_scan_chunk_elems": self.grad_scan_chunk_elems,
         }
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
@@ -202,6 +264,146 @@ class ExpertBufProbeCallback(TrainerCallback):
         print(
             f"[expert_buf_probe] baseline captured: {len(self.targets)} expert slices "
             f"(from {len(candidates)} candidates)",
+            flush=True,
+        )
+        if self.grad_probe_enabled:
+            self._emit_grad("WAITING", "waiting for the first optimizer step")
+
+    def on_pre_optimizer_step(self, args, state, control, model=None, optimizer=None, **kwargs):
+        """Record C++ grad buffers and optimizer-visible Parameter.grad before step()."""
+        if not self.grad_probe_enabled or model is None:
+            return
+
+        wrappers = _find_kt_wrappers(model) or []
+        records: list[dict[str, Any]] = []
+        projection_summary: dict[str, dict[str, int]] = {}
+
+        for w in wrappers:
+            if not getattr(w, "_full_weight_grad", False) or w.wrapper is None:
+                continue
+            inner = w.wrapper
+            layer_idx = int(w.layer_idx)
+            weight_bufs = _buf_map(inner)
+            grad_bufs = _grad_buf_map(inner)
+            for proj_name in ("gate_proj", "up_proj", "down_proj"):
+                grad_buf = grad_bufs.get(proj_name)
+                param = getattr(inner, f"{proj_name}_buf", None)
+                if grad_buf is None:
+                    records.append(
+                        {
+                            "layer_idx": layer_idx,
+                            "proj": proj_name,
+                            "status": "MISSING_GRAD_BUFFER",
+                        }
+                    )
+                    continue
+
+                grad_stats = _scan_grad_tensor(grad_buf, self.grad_scan_chunk_elems)
+                param_grad = getattr(param, "grad", None) if param is not None else None
+                shares_storage = bool(
+                    param_grad is not None
+                    and param_grad.numel() == grad_buf.numel()
+                    and param_grad.data_ptr() == grad_buf.data_ptr()
+                )
+                if param_grad is None:
+                    param_grad_stats: dict[str, Any] = {"present": False}
+                elif shares_storage:
+                    param_grad_stats = {**grad_stats, "present": True}
+                else:
+                    param_grad_stats = _scan_grad_tensor(param_grad, self.grad_scan_chunk_elems)
+
+                record = {
+                    "layer_idx": layer_idx,
+                    "proj": proj_name,
+                    "status": "OK",
+                    "parameter_in_weight_map": proj_name in weight_bufs,
+                    "parameter_requires_grad": bool(getattr(param, "requires_grad", False)),
+                    "parameter_grad_shares_storage": shares_storage,
+                    "grad_buffer": grad_stats,
+                    "parameter_grad": param_grad_stats,
+                }
+                records.append(record)
+
+                proj_stats = projection_summary.setdefault(
+                    proj_name,
+                    {
+                        "records": 0,
+                        "nonzero_grad_buffers": 0,
+                        "parameter_grads_present": 0,
+                        "nonzero_parameter_grads": 0,
+                        "max_abs_grad_buffer": 0.0,
+                        "max_abs_parameter_grad": 0.0,
+                    },
+                )
+                proj_stats["records"] += 1
+                if grad_stats["nonzero_elements"] > 0:
+                    proj_stats["nonzero_grad_buffers"] += 1
+                if param_grad_stats.get("present"):
+                    proj_stats["parameter_grads_present"] += 1
+                if param_grad_stats.get("nonzero_elements", 0) > 0:
+                    proj_stats["nonzero_parameter_grads"] += 1
+                proj_stats["max_abs_grad_buffer"] = max(
+                    float(proj_stats["max_abs_grad_buffer"]),
+                    float(grad_stats.get("max_abs") or 0.0),
+                )
+                proj_stats["max_abs_parameter_grad"] = max(
+                    float(proj_stats["max_abs_parameter_grad"]),
+                    float(param_grad_stats.get("max_abs") or 0.0),
+                )
+
+        ok_records = [r for r in records if r.get("status") == "OK"]
+        buffer_nonzero = sum(r["grad_buffer"]["nonzero_elements"] > 0 for r in ok_records)
+        param_present = sum(bool(r["parameter_grad"].get("present")) for r in ok_records)
+        param_nonzero = sum(r["parameter_grad"].get("nonzero_elements", 0) > 0 for r in ok_records)
+        nonfinite_buffers = sum(not r["grad_buffer"]["finite"] for r in ok_records)
+        nonfinite_params = sum(
+            bool(r["parameter_grad"].get("present")) and not r["parameter_grad"].get("finite", False)
+            for r in ok_records
+        )
+
+        lrs = []
+        if optimizer is not None:
+            lrs = [float(group.get("lr", 0.0)) for group in optimizer.param_groups]
+
+        step_record = {
+            "optimizer_step": int(getattr(state, "global_step", 0) or 0) + 1,
+            "global_step_before_optimizer": int(getattr(state, "global_step", 0) or 0),
+            "learning_rates": lrs,
+            "summary": {
+                "records": len(records),
+                "ok_records": len(ok_records),
+                "nonzero_grad_buffers": buffer_nonzero,
+                "parameter_grads_present": param_present,
+                "nonzero_parameter_grads": param_nonzero,
+                "nonfinite_grad_buffers": nonfinite_buffers,
+                "nonfinite_parameter_grads": nonfinite_params,
+                "total_nonzero_grad_buffer_elements": sum(
+                    int(r["grad_buffer"]["nonzero_elements"]) for r in ok_records
+                ),
+                "total_nonzero_parameter_grad_elements": sum(
+                    int(r["parameter_grad"].get("nonzero_elements", 0)) for r in ok_records
+                ),
+                "max_abs_grad_buffer": max(
+                    (float(r["grad_buffer"].get("max_abs") or 0.0) for r in ok_records),
+                    default=0.0,
+                ),
+                "max_abs_parameter_grad": max(
+                    (float(r["parameter_grad"].get("max_abs") or 0.0) for r in ok_records),
+                    default=0.0,
+                ),
+                "projection_summary": projection_summary,
+            },
+            "records": records,
+        }
+        self.gradient_steps.append(step_record)
+
+        grad_status, grad_reason = self._gradient_status(step_record)
+        overall_status, overall_reason = self._overall_gradient_status()
+        self._emit_grad(overall_status, overall_reason)
+        print(
+            f"[expert_grad_probe] step={step_record['optimizer_step']} status={grad_status} "
+            f"buffer_nonzero={buffer_nonzero}/{len(ok_records)} "
+            f"param_grad_nonzero={param_nonzero}/{len(ok_records)} lr={lrs}",
             flush=True,
         )
 
@@ -308,6 +510,9 @@ class ExpertBufProbeCallback(TrainerCallback):
             "records": records,
         }
         self._emit(result)
+        if self.grad_probe_enabled:
+            grad_status, grad_reason = self._overall_gradient_status()
+            self._emit_grad(grad_status, grad_reason)
         print(
             f"[expert_buf_probe] done status={status} changed={len(changed)}/{len(ok_records)} "
             f"nonfinite={len(nonfinite)} -> {self.out_path}",
@@ -317,6 +522,61 @@ class ExpertBufProbeCallback(TrainerCallback):
     def _emit(self, obj: dict[str, Any]) -> None:
         self.out_path.parent.mkdir(parents=True, exist_ok=True)
         self.out_path.write_text(json.dumps(obj, indent=2, ensure_ascii=False))
+
+    @staticmethod
+    def _gradient_status(step_record: dict[str, Any]) -> tuple[str, str]:
+        summary = step_record["summary"]
+        ok_records = int(summary["ok_records"])
+        if ok_records == 0:
+            return "ERROR", "no expert gradient buffers were available to scan"
+        if summary["nonfinite_grad_buffers"] or summary["nonfinite_parameter_grads"]:
+            return "FAIL_NUMERIC", "non-finite values were found in expert gradients"
+        if summary["nonzero_grad_buffers"] == 0:
+            return "FAIL_CPP_GRAD", "all scanned grad_*_proj_buf tensors were zero"
+        if summary["parameter_grads_present"] == 0 or summary["nonzero_parameter_grads"] == 0:
+            return "FAIL_AUTOGRAD", "C++ grad buffers were nonzero but optimizer-visible Parameter.grad was absent or zero"
+        if (
+            summary["records"] != ok_records
+            or summary["nonzero_grad_buffers"] != ok_records
+            or summary["parameter_grads_present"] != ok_records
+            or summary["nonzero_parameter_grads"] != ok_records
+        ):
+            return "PARTIAL", "some layer/projection gradients were missing or zero"
+        return "PASS", "all expert grad buffers reached nonzero finite optimizer-visible Parameter.grad tensors"
+
+    def _overall_gradient_status(self) -> tuple[str, str]:
+        if not self.gradient_steps:
+            return "ERROR", "training ended without an optimizer-step gradient snapshot"
+        statuses = [self._gradient_status(step)[0] for step in self.gradient_steps]
+        for fatal_status in ("FAIL_NUMERIC", "FAIL_CPP_GRAD", "FAIL_AUTOGRAD", "ERROR"):
+            if fatal_status in statuses:
+                failed_steps = [
+                    step["optimizer_step"]
+                    for step, status in zip(self.gradient_steps, statuses)
+                    if status == fatal_status
+                ]
+                return fatal_status, f"optimizer steps {failed_steps} reported {fatal_status}"
+        if all(status == "PASS" for status in statuses):
+            return "PASS", "all recorded optimizer steps passed the expert gradient checks"
+        return "PARTIAL", f"per-step gradient statuses: {statuses}"
+
+    def _emit_grad(self, status: str, reason: str) -> None:
+        obj = {
+            "status": status,
+            "reason": reason,
+            "method": "pre_optimizer_full_expert_gradient_scan",
+            "note": (
+                "Scans every layer's grad_gate/up/down_proj_buf immediately before optimizer.step, "
+                "and compares it with the corresponding optimizer-visible Parameter.grad."
+            ),
+            "meta": {
+                **self.meta,
+                "gradient_steps_recorded": len(self.gradient_steps),
+            },
+            "steps": self.gradient_steps,
+        }
+        self.grad_out_path.parent.mkdir(parents=True, exist_ok=True)
+        self.grad_out_path.write_text(json.dumps(obj, indent=2, ensure_ascii=False))
 
 
 def install_probe() -> None:

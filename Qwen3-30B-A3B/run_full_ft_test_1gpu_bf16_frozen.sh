@@ -15,12 +15,18 @@
 #
 # Usage:
 #   bash run_full_ft_test_1gpu_bf16_frozen.sh [--gpus 1] [--phase4-steps 15] \
-#                                              [--gas 1] [--dry-run]
+#                                              [--gas 1] [--gdb] [--gdb-core] \
+#                                              [--dry-run]
 #
-#   --gas N   gradient_accumulation_steps (default: 1)
+#   --gas N      gradient_accumulation_steps (default: 1)
+#   --gdb        run the real training process under batch GDB and capture SIGSEGV
+#   --gdb-core   also generate a core file (may require hundreds of GB; implies --gdb)
 # =============================================================================
 
 set -euo pipefail
+
+# Keep run-directory names and all child-process logs in the expected local time.
+export TZ="${FFT_TIMEZONE:-Asia/Shanghai}"
 
 # --------------------------------------------------------------------------- #
 # REAL full fine-tuning switch + expert-base-only freeze ablation
@@ -86,9 +92,13 @@ CONDA_BIN_DIR="$(dirname "${PYTHON}")"
 # --------------------------------------------------------------------------- #
 NUM_GPUS=1                                                      # Single-card by default
 DRY_RUN=0
+GDB_MODE=0
+GDB_GENERATE_CORE=0
 PHASE4_STEPS=15
 OOM_FALLBACK_DONE=0   # Prevent infinite retry on OOM
 BACKEND_LABEL="AMX_BF16_FULLFT_EXPERTONLY"
+GDB_COMMAND_FILE="${SCRIPT_DIR}/gdb_sigsegv.gdb"
+GDB_BIN=""
 # In-training expert base-weight probe (samples gate/up/down_proj_buf).
 # Do NOT compare HF checkpoint expert weights: those are zero-storage placeholders.
 EXPERT_CHECK_SAMPLES="${EXPERT_CHECK_SAMPLES:-12}"
@@ -111,6 +121,8 @@ while [[ $# -gt 0 ]]; do
                 echo "Invalid --gas value: ${GRAD_ACCUM_STEPS} (must be positive integer)"
                 exit 1
             fi ;;
+        --gdb) GDB_MODE=1 ;;
+        --gdb-core) GDB_MODE=1; GDB_GENERATE_CORE=1 ;;
         --dry-run) DRY_RUN=1 ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
@@ -203,6 +215,44 @@ check_env() {
         exit 1
     fi
     ok "accelerate $(${PYTHON} -c 'import accelerate; print(accelerate.__version__)')"
+
+    if [[ "${GDB_MODE}" -eq 1 ]]; then
+        if [[ "${NUM_GPUS}" -ne 1 ]]; then
+            error "--gdb currently supports only the 1-GPU reproducer"
+            exit 1
+        fi
+        GDB_BIN="$(command -v gdb || true)"
+        if [[ -z "${GDB_BIN}" ]]; then
+            error "--gdb requested but gdb is not installed"
+            exit 1
+        fi
+        if [[ ! -f "${GDB_COMMAND_FILE}" ]]; then
+            error "GDB command file not found: ${GDB_COMMAND_FILE}"
+            exit 1
+        fi
+        ok "GDB: $(${GDB_BIN} --version | head -1)"
+        log "GDB command file: ${GDB_COMMAND_FILE}"
+
+        local kt_ext
+        kt_ext="$(${PYTHON} -c 'import kt_kernel.kt_kernel_ext as ext; print(ext.__file__)' 2>/dev/null || true)"
+        if [[ -n "${kt_ext}" ]] && [[ -f "${kt_ext}" ]]; then
+            log "KT extension loaded by test: ${kt_ext}"
+            if file "${kt_ext}" | grep -qi 'stripped'; then
+                warn "KT extension is stripped; GDB can capture the fault address but not reliable C++ source lines"
+                warn "Rebuild/install with CPUINFER_BUILD_TYPE=RelWithDebInfo before the GDB run"
+            elif readelf -S "${kt_ext}" 2>/dev/null | grep -q '\.debug_info'; then
+                ok "KT extension contains debug information"
+            else
+                warn "KT extension has no .debug_info section; exact source-line resolution may be unavailable"
+            fi
+        else
+            warn "Could not resolve the kt_kernel_ext loaded by ${PYTHON}"
+        fi
+
+        if [[ "${GDB_GENERATE_CORE}" -eq 1 ]]; then
+            warn "Core generation enabled; this process can consume hundreds of GB"
+        fi
+    fi
 
     for pkg in psutil pynvml matplotlib pandas; do
         if "${PYTHON}" -c "import ${pkg}" &>/dev/null; then
@@ -401,7 +451,30 @@ run_train() {
     [[ ! -x "${accelerate_bin}" ]] && accelerate_bin="accelerate"
 
     local probe_out="${LOG_DIR}/${phase_name}/expert_buf_probe.json"
+    local grad_probe_out="${LOG_DIR}/${phase_name}/expert_grad_probe.json"
     local timing_dir="${LOG_DIR}/${phase_name}/step_timing"
+    local gdb_log="${LOG_DIR}/${phase_name}/gdb_sigsegv.log"
+    local gdb_core="${LOG_DIR}/${phase_name}/core.sigsegv"
+    local launch_args=()
+    if [[ "${GDB_MODE}" -eq 1 ]]; then
+        log "  GDB capture       : ${gdb_log}"
+        launch_args=(
+            --no_python
+            "${GDB_BIN}"
+            --batch
+            --quiet
+            --return-child-result
+            -x "${GDB_COMMAND_FILE}"
+            --args "${PYTHON}"
+            -m "${TRAIN_ENTRY_MODULE}" train
+            "${train_cfg}"
+        )
+    else
+        launch_args=(
+            -m "${TRAIN_ENTRY_MODULE}" train
+            "${train_cfg}"
+        )
+    fi
     local cmd=(
         env
         USE_KT=1
@@ -414,6 +487,8 @@ run_train() {
         KT_EXPERT_BUF_PROBE_SAMPLES="${EXPERT_CHECK_SAMPLES}"
         KT_EXPERT_BUF_PROBE_SEED="${EXPERT_CHECK_SEED}"
         KT_EXPERT_BUF_PROBE_ATOL="${EXPERT_CHECK_ATOL}"
+        KT_EXPERT_GRAD_PROBE=1
+        KT_EXPERT_GRAD_PROBE_OUT="${grad_probe_out}"
         KT_STEP_TIMING=1
         KT_STEP_TIMING_OUT_DIR="${timing_dir}"
         KT_STEP_TIMING_WARMUP_SKIP="${WARMUP_SKIP}"
@@ -422,12 +497,16 @@ run_train() {
         KT_STALL_WATCH_OUT_DIR="${timing_dir}"
         KT_STALL_WATCH_IDLE_SEC="${STALL_WATCH_IDLE_SEC:-5}"
         KT_STALL_WATCH_PHASES="${STALL_WATCH_PHASES:-optimizer,backward,post_optim}"
+        PYTHONFAULTHANDLER=1
+        TORCH_SHOW_CPP_STACKTRACES=1
+        FFT_GDB_LOG="${gdb_log}"
+        FFT_GDB_CORE="${gdb_core}"
+        FFT_GDB_GENERATE_CORE="${GDB_GENERATE_CORE}"
         PYTHONPATH="${PROBE_MODULE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
         CUDA_VISIBLE_DEVICES="${gpus_str}"
         "${accelerate_bin}" launch
         --config_file "${ACCEL_CONFIG}"
-        -m "${TRAIN_ENTRY_MODULE}" train
-        "${train_cfg}"
+        "${launch_args[@]}"
     )
 
     if [[ "${DRY_RUN}" -eq 1 ]]; then
@@ -444,8 +523,16 @@ run_train() {
 
     send_event "event:train_end"
 
+    if [[ "${GDB_MODE}" -eq 1 ]]; then
+        if [[ -s "${gdb_log}" ]]; then
+            log "GDB SIGSEGV report: ${gdb_log}"
+        else
+            log "No SIGSEGV report produced by GDB (the process may have exited for another reason)"
+        fi
+    fi
+
     # ---- OOM auto-fallback: 1 GPU → 2 GPUs (one attempt only) ----
-    if [[ "${exit_code}" -ne 0 ]] && [[ "${OOM_FALLBACK_DONE}" -eq 0 ]]; then
+    if [[ "${exit_code}" -ne 0 ]] && [[ "${OOM_FALLBACK_DONE}" -eq 0 ]] && [[ "${GDB_MODE}" -eq 0 ]]; then
         if grep -qi "out of memory\|cuda error.*out of memory\|oom\|cudamalloc failed" "${phase_log}" 2>/dev/null; then
             if [[ "${NUM_GPUS}" -eq 1 ]]; then
                 warn "OOM detected on single GPU — switching to 2-GPU config and retrying..."
@@ -470,6 +557,8 @@ run_train() {
                     KT_EXPERT_BUF_PROBE_SAMPLES="${EXPERT_CHECK_SAMPLES}"
                     KT_EXPERT_BUF_PROBE_SEED="${EXPERT_CHECK_SEED}"
                     KT_EXPERT_BUF_PROBE_ATOL="${EXPERT_CHECK_ATOL}"
+                    KT_EXPERT_GRAD_PROBE=1
+                    KT_EXPERT_GRAD_PROBE_OUT="${grad_probe_out}"
                     KT_STEP_TIMING=1
                     KT_STEP_TIMING_OUT_DIR="${timing_dir}"
                     KT_STEP_TIMING_WARMUP_SKIP="${WARMUP_SKIP}"
@@ -544,7 +633,7 @@ analyze_log() {
         echo ""
         echo "--- Process exit code analysis ---"
         if grep -qi "segmentation fault\|sigsegv\|core dumped" "${log_file}"; then
-            echo "⚠ SIGSEGV / core dump detected (P5: C++ gradient index out of bounds)"
+            echo "⚠ SIGSEGV / core dump detected (root cause pending GDB backtrace)"
         fi
         if grep -qi "cuda out of memory\|oom" "${log_file}"; then
             echo "⚠ CUDA OOM detected"
@@ -930,6 +1019,67 @@ for r in data.get("records", []):
 PYEOF
 }
 
+verify_expert_gradients() {
+    phase_banner "Expert Gradient Probe (pre-optimizer full scan)"
+
+    local probe_json="${LOG_DIR}/phase4/expert_grad_probe.json"
+    local report_txt="${LOG_DIR}/expert_gradient_check.txt"
+    local report_json="${LOG_DIR}/expert_gradient_check.json"
+
+    "${PYTHON}" - "${probe_json}" "${report_json}" <<'PYEOF' | tee "${report_txt}"
+import json
+import shutil
+import sys
+from pathlib import Path
+
+probe_path = Path(sys.argv[1])
+report_json = Path(sys.argv[2])
+
+print("=== Expert Gradient Probe (pre-optimizer) ===")
+print("method                 : full scan of grad_*_proj_buf and corresponding Parameter.grad")
+print(f"probe_json             : {probe_path}")
+
+if not probe_path.exists():
+    obj = {
+        "status": "ERROR",
+        "reason": "expert gradient probe JSON missing; training may have failed before optimizer step",
+        "method": "pre_optimizer_full_expert_gradient_scan",
+        "steps": [],
+    }
+    report_json.write_text(json.dumps(obj, indent=2, ensure_ascii=False))
+    print(f"status                 : {obj['status']}")
+    print(f"reason                 : {obj['reason']}")
+    raise SystemExit(0)
+
+data = json.loads(probe_path.read_text())
+shutil.copyfile(probe_path, report_json)
+print(f"status                 : {data.get('status')}")
+print(f"reason                 : {data.get('reason', '')}")
+print(f"steps_recorded         : {len(data.get('steps') or [])}")
+print(f"json                   : {report_json}")
+
+for step in data.get("steps") or []:
+    summary = step.get("summary") or {}
+    print()
+    print(f"--- optimizer step {step.get('optimizer_step')} ---")
+    print(f"learning_rates         : {step.get('learning_rates', [])}")
+    print(f"nonzero_grad_buffers   : {summary.get('nonzero_grad_buffers', 0)}/{summary.get('ok_records', 0)}")
+    print(f"parameter_grads_present: {summary.get('parameter_grads_present', 0)}/{summary.get('ok_records', 0)}")
+    print(f"nonzero_parameter_grads: {summary.get('nonzero_parameter_grads', 0)}/{summary.get('ok_records', 0)}")
+    print(f"nonfinite_grad_buffers : {summary.get('nonfinite_grad_buffers', 0)}")
+    print(f"nonfinite_param_grads  : {summary.get('nonfinite_parameter_grads', 0)}")
+    print(f"max_abs_grad_buffer    : {summary.get('max_abs_grad_buffer', 0.0):.8e}")
+    print(f"max_abs_parameter_grad : {summary.get('max_abs_parameter_grad', 0.0):.8e}")
+    for proj, proj_stats in (summary.get("projection_summary") or {}).items():
+        print(
+            f"  {proj}: buffer_nonzero={proj_stats.get('nonzero_grad_buffers', 0)}/{proj_stats.get('records', 0)} "
+            f"param_nonzero={proj_stats.get('nonzero_parameter_grads', 0)}/{proj_stats.get('records', 0)}"
+            f" max_abs_buffer={proj_stats.get('max_abs_grad_buffer', 0.0):.8e}"
+            f" max_abs_param={proj_stats.get('max_abs_parameter_grad', 0.0):.8e}"
+        )
+PYEOF
+}
+
 # --------------------------------------------------------------------------- #
 # Phase 4: Stability extension + accurate TPS measurement
 # --------------------------------------------------------------------------- #
@@ -1074,6 +1224,7 @@ PYEOF
 
     analyze_log "phase4"
     echo "${exit_code}" > "${LOG_DIR}/phase4/exit_code.txt"
+    verify_expert_gradients
     verify_expert_weight_changes
     cleanup_model_output "phase4"
 }
@@ -1097,6 +1248,11 @@ generate_summary() {
         echo "**模型**: Qwen3MoeForCausalLM（纯文本，48 层，128 experts）"
         echo "**数据集**: ${DATASET_NAME}（100 条，样本 >7000 tokens，截断至 ${CUTOFF_LEN}）"
         echo "**GAS**: ${GRAD_ACCUM_STEPS}"
+        if [[ "${GDB_MODE}" -eq 1 ]]; then
+            echo "**GDB**: 已启用（SIGSEGV 报告: \`${LOG_DIR}/phase4/gdb_sigsegv.log\`；core: ${GDB_GENERATE_CORE}）"
+        else
+            echo "**GDB**: 未启用"
+        fi
         echo "**消融设置**: \`KT_FREEZE_NON_EXPERT_BASE=1\` — 冻结 attention / embed / lm_head / router / LoRA；仅 \`gate/up/down_proj_buf\` 可训练"
         echo "**预期**: 若 \`full_weight_grad\` TP 丢失成立，则 train_loss 应基本不降，且 expert probe \`changed=0\`"
         echo ""
@@ -1304,6 +1460,18 @@ PYEOF
         echo "| P6 | Router 梯度稳定性 | 见 plots/04_grad_norm.png |"
         echo "| P7 | update_base_weights 开销 | 见 phase4_analysis.txt / step_timing |"
 
+        if [[ "${GDB_MODE}" -eq 1 ]]; then
+            echo ""
+            echo "### GDB SIGSEGV 定位"
+            echo ""
+            echo "- 回溯日志: \`${LOG_DIR}/phase4/gdb_sigsegv.log\`"
+            if [[ "${GDB_GENERATE_CORE}" -eq 1 ]]; then
+                echo "- Core: \`${LOG_DIR}/phase4/core.sigsegv\`"
+            else
+                echo "- Core: 未启用（避免占满磁盘；需要时使用 \`--gdb-core\`）"
+            fi
+        fi
+
         echo ""
         echo "## 7. 后续分析"
         echo ""
@@ -1339,6 +1507,7 @@ main() {
     echo -e "KT train mode: ${ACCELERATE_KT_TRAIN_MODE}  |  freeze_non_expert_base: ${KT_FREEZE_NON_EXPERT_BASE}"
     echo -e "Trainable: gate/up/down_proj_buf ONLY (attention/router/LoRA frozen)"
     echo -e "Entry module: ${TRAIN_ENTRY_MODULE}"
+    echo -e "GDB: $([[ "${GDB_MODE}" -eq 1 ]] && echo enabled || echo disabled)  |  core: ${GDB_GENERATE_CORE}"
     echo -e "Dataset: ${DATASET_NAME} @ ${DATA_DIR}  (every sample >7000 tokens)"
     echo -e "GPUs: ${NUM_GPUS}  |  cutoff_len: ${CUTOFF_LEN}  |  GAS: ${GRAD_ACCUM_STEPS}  |  warmup_skip: ${WARMUP_SKIP}"
     echo ""

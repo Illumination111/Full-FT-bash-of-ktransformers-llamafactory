@@ -37,6 +37,9 @@
 
 set -euo pipefail
 
+# Keep run-directory names and all child-process logs in the expected local time.
+export TZ="${FFT_TIMEZONE:-Asia/Shanghai}"
+
 # --------------------------------------------------------------------------- #
 # REAL full fine-tuning switch: this env var is what actually enables
 # kt_full_weight_grad in kt_kernel (KTConfig reads ACCELERATE_KT_TRAIN_MODE,
@@ -414,6 +417,7 @@ run_train() {
     [[ ! -x "${accelerate_bin}" ]] && accelerate_bin="accelerate"
 
     local probe_out="${LOG_DIR}/${phase_name}/expert_buf_probe.json"
+    local grad_probe_out="${LOG_DIR}/${phase_name}/expert_grad_probe.json"
     local timing_dir="${LOG_DIR}/${phase_name}/step_timing"
     local cmd=(
         env
@@ -425,6 +429,8 @@ run_train() {
         KT_EXPERT_BUF_PROBE_SAMPLES="${EXPERT_CHECK_SAMPLES}"
         KT_EXPERT_BUF_PROBE_SEED="${EXPERT_CHECK_SEED}"
         KT_EXPERT_BUF_PROBE_ATOL="${EXPERT_CHECK_ATOL}"
+        KT_EXPERT_GRAD_PROBE=1
+        KT_EXPERT_GRAD_PROBE_OUT="${grad_probe_out}"
         KT_STEP_TIMING=1
         KT_STEP_TIMING_OUT_DIR="${timing_dir}"
         KT_STEP_TIMING_WARMUP_SKIP="${WARMUP_SKIP}"
@@ -479,6 +485,8 @@ run_train() {
                     KT_EXPERT_BUF_PROBE_SAMPLES="${EXPERT_CHECK_SAMPLES}"
                     KT_EXPERT_BUF_PROBE_SEED="${EXPERT_CHECK_SEED}"
                     KT_EXPERT_BUF_PROBE_ATOL="${EXPERT_CHECK_ATOL}"
+                    KT_EXPERT_GRAD_PROBE=1
+                    KT_EXPERT_GRAD_PROBE_OUT="${grad_probe_out}"
                     KT_STEP_TIMING=1
                     KT_STEP_TIMING_OUT_DIR="${timing_dir}"
                     KT_STEP_TIMING_WARMUP_SKIP="${WARMUP_SKIP}"
@@ -939,6 +947,67 @@ for r in data.get("records", []):
 PYEOF
 }
 
+verify_expert_gradients() {
+    phase_banner "Expert Gradient Probe (pre-optimizer full scan)"
+
+    local probe_json="${LOG_DIR}/phase4/expert_grad_probe.json"
+    local report_txt="${LOG_DIR}/expert_gradient_check.txt"
+    local report_json="${LOG_DIR}/expert_gradient_check.json"
+
+    "${PYTHON}" - "${probe_json}" "${report_json}" <<'PYEOF' | tee "${report_txt}"
+import json
+import shutil
+import sys
+from pathlib import Path
+
+probe_path = Path(sys.argv[1])
+report_json = Path(sys.argv[2])
+
+print("=== Expert Gradient Probe (pre-optimizer) ===")
+print("method                 : full scan of grad_*_proj_buf and corresponding Parameter.grad")
+print(f"probe_json             : {probe_path}")
+
+if not probe_path.exists():
+    obj = {
+        "status": "ERROR",
+        "reason": "expert gradient probe JSON missing; training may have failed before optimizer step",
+        "method": "pre_optimizer_full_expert_gradient_scan",
+        "steps": [],
+    }
+    report_json.write_text(json.dumps(obj, indent=2, ensure_ascii=False))
+    print(f"status                 : {obj['status']}")
+    print(f"reason                 : {obj['reason']}")
+    raise SystemExit(0)
+
+data = json.loads(probe_path.read_text())
+shutil.copyfile(probe_path, report_json)
+print(f"status                 : {data.get('status')}")
+print(f"reason                 : {data.get('reason', '')}")
+print(f"steps_recorded         : {len(data.get('steps') or [])}")
+print(f"json                   : {report_json}")
+
+for step in data.get("steps") or []:
+    summary = step.get("summary") or {}
+    print()
+    print(f"--- optimizer step {step.get('optimizer_step')} ---")
+    print(f"learning_rates         : {step.get('learning_rates', [])}")
+    print(f"nonzero_grad_buffers   : {summary.get('nonzero_grad_buffers', 0)}/{summary.get('ok_records', 0)}")
+    print(f"parameter_grads_present: {summary.get('parameter_grads_present', 0)}/{summary.get('ok_records', 0)}")
+    print(f"nonzero_parameter_grads: {summary.get('nonzero_parameter_grads', 0)}/{summary.get('ok_records', 0)}")
+    print(f"nonfinite_grad_buffers : {summary.get('nonfinite_grad_buffers', 0)}")
+    print(f"nonfinite_param_grads  : {summary.get('nonfinite_parameter_grads', 0)}")
+    print(f"max_abs_grad_buffer    : {summary.get('max_abs_grad_buffer', 0.0):.8e}")
+    print(f"max_abs_parameter_grad : {summary.get('max_abs_parameter_grad', 0.0):.8e}")
+    for proj, proj_stats in (summary.get("projection_summary") or {}).items():
+        print(
+            f"  {proj}: buffer_nonzero={proj_stats.get('nonzero_grad_buffers', 0)}/{proj_stats.get('records', 0)} "
+            f"param_nonzero={proj_stats.get('nonzero_parameter_grads', 0)}/{proj_stats.get('records', 0)}"
+            f" max_abs_buffer={proj_stats.get('max_abs_grad_buffer', 0.0):.8e}"
+            f" max_abs_param={proj_stats.get('max_abs_parameter_grad', 0.0):.8e}"
+        )
+PYEOF
+}
+
 # --------------------------------------------------------------------------- #
 # Phase 4: Stability extension + accurate TPS measurement
 # --------------------------------------------------------------------------- #
@@ -1083,6 +1152,7 @@ PYEOF
 
     analyze_log "phase4"
     echo "${exit_code}" > "${LOG_DIR}/phase4/exit_code.txt"
+    verify_expert_gradients
     verify_expert_weight_changes
     cleanup_model_output "phase4"
 }
