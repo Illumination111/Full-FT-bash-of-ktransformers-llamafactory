@@ -1,4 +1,4 @@
-"""Per-step Full-FT timing probe for KTransformers / HuggingFace Trainer.
+"""Per-step Full/LoRA timing probe for KTransformers / HuggingFace Trainer.
 
 Aligns with tqdm s/it (TPS denominator) by timing one optimizer-step cycle as:
   get_batch_samples (dataloader)
@@ -98,10 +98,12 @@ class StepTimingRecorder:
         out_dir: Path,
         warmup_skip: int = 0,
         tokens_per_step: int = 0,
+        finetune_mode: str = "unknown",
     ) -> None:
         self.out_dir = Path(out_dir)
         self.warmup_skip = warmup_skip
         self.tokens_per_step = tokens_per_step
+        self.finetune_mode = finetune_mode
         self.steps: list[dict[str, Any]] = []
         self._cur: dict[str, float] | None = None
         self._step_t0: float | None = None
@@ -249,6 +251,7 @@ class StepTimingRecorder:
         return {
             "status": "OK",
             "warmup_skip": self.warmup_skip,
+            "finetune_mode": self.finetune_mode,
             "tokens_per_step": self.tokens_per_step,
             "num_steps": len(self.steps),
             "num_stable_steps": len(stable),
@@ -260,9 +263,9 @@ class StepTimingRecorder:
                 "dataloader_sec": "get_batch_samples / DataLoader next (before on_step_begin; in tqdm s/it)",
                 "data_prep_sec": "input prepare / device transfer before forward",
                 "forward_sec": "model forward + loss (compute_loss), exclusive of nested requant",
-                "backward_sec": "accelerator.backward / autograd (CPU AMX expert backward dominates in Full FT)",
+                "backward_sec": "accelerator.backward / autograd (CPU AMX expert backward plus GPU autograd)",
                 "clip_grad_sec": "gradient clipping",
-                "optimizer_sec": "optimizer.step (AdamW on GPU non-expert + CPU expert buffers)",
+                "optimizer_sec": "optimizer.step (AdamW on mode-specific trainable GPU/CPU parameters)",
                 "post_optim_sec": "KT pointer sync + lr_scheduler + zero_grad",
                 "update_base_weights_sec": "KT update_base_weights / online requant (often nested inside next forward)",
                 "log_save_eval_sec": "_maybe_log_save_evaluate (metric log / checkpoint / eval)",
@@ -341,7 +344,8 @@ def build_tps_attribution(agg: dict[str, Any], tokens_per_step: int) -> dict[str
 
 def render_timing_markdown(summary: dict[str, Any]) -> str:
     lines: list[str] = []
-    lines.append("# Full-FT Step Timing Breakdown")
+    mode = summary.get("finetune_mode", "unknown")
+    lines.append(f"# {mode} Fine-Tuning Step Timing Breakdown")
     lines.append("")
     if summary.get("status") != "OK":
         lines.append(f"status: {summary.get('status')}")
@@ -513,10 +517,12 @@ def parse_job_timing_from_train_log(train_log: Path | str) -> dict[str, Any]:
 def render_summary_timing_section(
     step_timing: dict[str, Any] | None,
     job_timing: dict[str, Any] | None = None,
+    finetune_mode: str | None = None,
 ) -> str:
     """Markdown block for Chinese summary.md."""
     lines: list[str] = []
-    lines.append("## TPS 瓶颈拆解（Full-FT Step Timing）")
+    mode = finetune_mode or (step_timing or {}).get("finetune_mode") or "unknown"
+    lines.append(f"## TPS 瓶颈拆解（{mode} Step Timing）")
     lines.append("")
 
     if not step_timing or step_timing.get("status") != "OK":
@@ -556,13 +562,13 @@ def render_summary_timing_section(
             share_s = f"{share * 100:.1f}%" if share is not None else "-"
             hint = ""
             if key == "backward_sec":
-                hint = "CPU AMX expert backward（P2）"
+                hint = "CPU AMX expert backward；Full 含基座 dW，LoRA 只含基座 dX + adapter 梯度"
             elif key == "update_base_weights_sec":
                 hint = "online requant（P7）"
             elif key == "forward_sec":
                 hint = "含 GPU attention + CPU expert forward"
             elif key == "optimizer_sec":
-                hint = "AdamW（GPU non-expert + CPU expert buf）"
+                hint = "AdamW；参数规模随 Full/LoRA 模式变化"
             elif key == "dataloader_sec":
                 hint = "DataLoader；过大说明输入侧卡住"
             elif key == "log_save_eval_sec":
@@ -861,7 +867,13 @@ def install_step_timing() -> StepTimingRecorder | None:
     out_dir = Path(os.environ.get("KT_STEP_TIMING_OUT_DIR", "step_timing_out"))
     warmup = _env_int("KT_STEP_TIMING_WARMUP_SKIP", 0)
     tokens = _env_int("KT_STEP_TIMING_TOKENS_PER_STEP", 0)
-    recorder = StepTimingRecorder(out_dir=out_dir, warmup_skip=warmup, tokens_per_step=tokens)
+    finetune_mode = os.environ.get("KT_FINETUNE_MODE", "unknown")
+    recorder = StepTimingRecorder(
+        out_dir=out_dir,
+        warmup_skip=warmup,
+        tokens_per_step=tokens,
+        finetune_mode=finetune_mode,
+    )
 
     _patch_get_batch_samples(recorder)
     _patch_training_step(recorder)

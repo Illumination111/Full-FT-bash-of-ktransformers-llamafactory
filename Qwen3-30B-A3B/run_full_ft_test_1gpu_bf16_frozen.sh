@@ -2,7 +2,8 @@
 # =============================================================================
 # Qwen3-30B-A3B Full-FT ablation: train EXPERT BASE WEIGHTS ONLY
 #
-# Based on run_full_ft_test_1gpu_bf16.sh, with one critical difference:
+# Ablation variant of the full mode in run_finetune_perf_test_bf16.sh, with
+# one critical difference:
 #   * Freeze ALL non-expert parameters (attention, embed, lm_head, router, LoRA).
 #   * Only KT expert base buffers remain trainable:
 #       gate_proj_buf / up_proj_buf / down_proj_buf

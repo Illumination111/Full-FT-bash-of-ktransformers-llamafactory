@@ -1,0 +1,50 @@
+# Qwen3-30B-A3B Full/LoRA performance-test base configuration.
+#
+# run_finetune_perf_test_bf16.sh creates one copy per method and injects
+# finetuning_type, output_dir and every shared comparison parameter.  Keep the
+# values below as safe standalone defaults; generated task configs are the
+# source of truth for benchmark runs.
+
+### model
+model_name_or_path: /mnt/data3/models/Qwen3-30B-A3B
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+
+### dataset
+dataset: fft_real_100
+dataset_dir: /mnt/data2/wbw/FFTtest/dataset
+template: qwen3
+cutoff_len: 1024
+max_samples: 100
+overwrite_cache: true
+preprocessing_num_workers: 8
+dataloader_num_workers: 2
+
+### output
+output_dir: /mnt/data2/wbw/FFTtest/Qwen3-30B-A3B/test_log/PLACEHOLDER
+logging_steps: 1
+save_steps: 500
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: true
+report_to: none
+
+### shared train parameters
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 1.0e-5
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 360000000
+resume_from_checkpoint: null
+max_grad_norm: 1.0
+
+### ktransformers
+use_kt: true
+kt_weight_path: /mnt/data3/models/Qwen3-30B-A3B

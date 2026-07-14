@@ -1,38 +1,30 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Qwen3-30B-A3B KTransformers REAL Full Fine-Tuning (FFT) Automated Test Script
+# Qwen3-30B-A3B KTransformers Fine-Tuning Performance Test (Full / LoRA)
 #
-# Difference from run_fft_test_1gpu_bf16.sh:
-#   * ACCELERATE_KT_TRAIN_MODE=full is exported → kt_full_weight_grad=True,
-#     i.e. TRUE full-weight expert gradients (all ~30B params trainable),
-#     NOT the fused-expert-LoRA/hybrid path.
-#   * cutoff_len = 1024 (every sample in fft_real_100 tokenizes to >7000
-#     tokens, so each step is truncated to EXACTLY 1024 real tokens).
-#   * Dataset: fft_real_100 in FFTtest/dataset (shared dataset dir).
+# Full and LoRA runs use the same dataset, batch size, GAS, GPU topology,
+# learning rate, max steps and post-warmup TPS interval.  Only the fine-tuning
+# method and LoRA-specific rank/alpha settings differ.  In `both` mode the
+# full-weight run always completes before the LoRA run starts.
 #
 # Usage:
-#   bash run_full_ft_test_1gpu_bf16.sh [--gpus 1] [--phase4-steps 15] \
-#                                       [--gas 1] [--dry-run]
+#   bash run_finetune_perf_test_bf16.sh [--mode both|full|lora]
+#        [--gpus 1] [--batch-size 1] [--gas 1]
+#        [--steps 15] [--warmup-steps 5] [--dry-run]
 #
 #   --gas N   gradient_accumulation_steps (default: 1; e.g. --gas 16)
 #
 # Test phase:
-#   Phase 4 — Stability extension (15 steps by default): measure TPS, convergence,
-#             MoE load, and runtime GPU/RAM usage.  The first WARMUP_SKIP=5
-#             steps are excluded from TPS.
-#
-# Key issues to expose:
-#   P2: backward_base_weight_grad not vectorized, extremely slow on CPU
-#   P4: MoE load imbalance, skewed routing distribution
-#   P5: Potential C++ gradient index bug (out-of-bounds / NaN)
-#   P6: Router gradient instability in full mode
-#   P7: update_base_weights() re-quantize overhead per step
+#   Performance run — measure TPS, forward/backward/optimizer timing and
+#                     runtime GPU/RAM usage.  Warmup steps are excluded from
+#                     every stable timing and FLOPs sanity-check metric.
 #
 # TPS Measurement (Phase 4):
-#   Accurate TPS is computed by skipping the first WARMUP_SKIP=5 steps and
+#   Accurate TPS is computed by skipping WARMUP_SKIP steps (default: 5) and
 #   using exactly cutoff_len=1024 tokens per micro-batch (all samples hit cutoff).
-#   One optimizer step processes GAS micro-batches (batch_size=1).
-#   Formula: TPS = NUM_GPUS * CUTOFF_LEN * GAS / avg_stable_step_time
+#   One optimizer step processes GAS micro-batches per GPU.
+#   Formula: TPS = NUM_GPUS * BATCH_SIZE * CUTOFF_LEN * GAS
+#                  / avg_stable_step_time
 # =============================================================================
 
 set -euo pipefail
@@ -41,42 +33,51 @@ set -euo pipefail
 export TZ="${FFT_TIMEZONE:-Asia/Shanghai}"
 
 # --------------------------------------------------------------------------- #
-# REAL full fine-tuning switch: this env var is what actually enables
-# kt_full_weight_grad in kt_kernel (KTConfig reads ACCELERATE_KT_TRAIN_MODE,
-# defaulting to "lora"). Without this, finetuning_type=full still runs the
-# fused-expert-LoRA path. Exported here so all child processes inherit it.
-# --------------------------------------------------------------------------- #
-export ACCELERATE_KT_TRAIN_MODE=full
-
-# --------------------------------------------------------------------------- #
 # Path configuration
 # --------------------------------------------------------------------------- #
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOG_BASE="${SCRIPT_DIR}/test_log"
+LOG_BASE="${FFT_LOG_BASE:-${SCRIPT_DIR}/test_log}"
 CONFIGS_DIR="${SCRIPT_DIR}/configs"
-# Shared dataset directory (real full-FT dataset lives here, not per-model data/)
+# Shared benchmark dataset directory (not the per-model data/ directory).
 DATA_DIR="/mnt/data2/wbw/FFTtest/dataset"
 DATASET_NAME="fft_real_100"
 GEN_DATASET_SCRIPT="${DATA_DIR}/gen_dataset.py"
 MONITOR_SCRIPT="${SCRIPT_DIR}/monitor.py"
 ANALYZE_SCRIPT="${SCRIPT_DIR}/analyze.py"
+FLOPS_ANALYZE_SCRIPT="${SCRIPT_DIR}/flops_timing_analysis.py"
 
 LLAMA_FACTORY_DIR="/mnt/data2/wbw/LLaMA-Factory"
 MODEL_PATH="/mnt/data3/models/Qwen3-30B-A3B"    # Original HF BF16 weights (AMXBF16 reads directly)
 
-# Default: 1 GPU; auto-fallback to 2 GPU on OOM
+# The selected accelerate config is shared by both fine-tuning methods.
 ACCEL_CONFIG_1GPU="${CONFIGS_DIR}/accelerate_fft_amxbf16_1gpu.yaml"
 ACCEL_CONFIG_2GPU="${CONFIGS_DIR}/accelerate_fft_amxbf16_2gpu.yaml"
+ACCEL_CONFIG_4GPU="${CONFIGS_DIR}/accelerate_fft_amxbf16_4gpu.yaml"
 ACCEL_CONFIG="${ACCEL_CONFIG_1GPU}"
 
-TRAIN_CONFIG_BASE="${CONFIGS_DIR}/train_full_ft_qwen3_30b.yaml"
+TRAIN_CONFIG_BASE="${CONFIGS_DIR}/train_finetune_perf_qwen3_30b.yaml"
 
 # TPS measurement constants (must match train config)
 CUTOFF_LEN=1024
-WARMUP_SKIP=5    # Steps to discard before computing stable TPS
-GRAD_ACCUM_STEPS=1   # Default GAS; override via --gas N
+WARMUP_SKIP=5
+PHASE4_STEPS=15
+TRAIN_BATCH_SIZE=1
+GRAD_ACCUM_STEPS=1
+LEARNING_RATE="1.0e-5"
 
-MONITOR_FIFO="/tmp/fft_monitor_events.fifo"
+# LoRA-only settings. `lora_target=all` is fixed so the FLOPs model matches the
+# actual adapter placement (all Linear modules except lm_head).
+LORA_RANK=8
+LORA_ALPHA=16
+
+# Roofline assumptions.  Defaults match RTX 4090 BF16 Tensor Core peak and the
+# 2x48-core Xeon 8488C AMX / 16-channel DDR5 host used by this test.
+GPU_BF16_TFLOPS="${GPU_BF16_TFLOPS:-82.58}"
+CPU_BF16_TFLOPS="${CPU_BF16_TFLOPS:-373.56}"
+GPU_MEMORY_GBPS="${GPU_MEMORY_GBPS:-1008.0}"
+CPU_MEMORY_GBPS="${CPU_MEMORY_GBPS:-614.4}"
+
+MONITOR_FIFO=""
 MONITOR_PID=""
 
 # Conda environment
@@ -103,37 +104,122 @@ CONDA_BIN_DIR="$(dirname "${PYTHON}")"
 # --------------------------------------------------------------------------- #
 NUM_GPUS=1                                                      # Single-card by default
 DRY_RUN=0
-PHASE4_STEPS=15
-OOM_FALLBACK_DONE=0   # Prevent infinite retry on OOM
-BACKEND_LABEL="AMX_BF16_FULLFT"
-# In-training expert base-weight probe (samples gate/up/down_proj_buf).
-# Do NOT compare HF checkpoint expert weights: those are zero-storage placeholders.
-EXPERT_CHECK_SAMPLES="${EXPERT_CHECK_SAMPLES:-12}"
-EXPERT_CHECK_SEED="${EXPERT_CHECK_SEED:-20260709}"
-EXPERT_CHECK_ATOL="${EXPERT_CHECK_ATOL:-0.0}"
-PROBE_MODULE_DIR="${SCRIPT_DIR}"
-TRAIN_ENTRY_MODULE="fft_train_with_probe"
+FINETUNE_SELECTION="both"
+BACKEND_LABEL="AMX_BF16"
+TIMING_MODULE_DIR="${SCRIPT_DIR}"
+TRAIN_ENTRY_MODULE="finetune_train_with_timing"
+SESSION_DIR=""
+LOG_DIR=""
+TRAIN_LOG_NAME=""
+FT_MODE=""
+FT_LOG_TAG=""
+FT_DISPLAY_NAME=""
+
+usage() {
+    cat <<'EOF'
+Usage: bash run_finetune_perf_test_bf16.sh [options]
+
+Fine-tuning selection:
+  --mode both|full|lora       Run both (full first), full only, or LoRA only (default: both)
+
+Shared comparison parameters:
+  --gpus N                    GPU count; supported values: 1, 2 or 4 (default: 1)
+  --batch-size N              Per-device train batch size (default: 1)
+  --gas N                     Gradient accumulation steps (default: 1)
+  --steps N                   Optimizer steps per method (default: 15)
+  --warmup-steps N            Initial steps excluded from TPS/timing (default: 5)
+  --learning-rate VALUE       Shared learning rate (default: 1.0e-5)
+
+LoRA parameters:
+  --lora-rank N               LoRA rank (default: 8)
+  --lora-alpha N              LoRA alpha (default: 16)
+
+Roofline assumptions:
+  --gpu-bf16-tflops VALUE     Peak BF16 TFLOPS per GPU (default: 82.58)
+  --cpu-bf16-tflops VALUE     Total host AMX BF16 TFLOPS (default: 373.56)
+  --gpu-memory-gbps VALUE     Memory bandwidth per GPU (default: 1008.0)
+  --cpu-memory-gbps VALUE     Total host memory bandwidth (default: 614.4)
+
+Other:
+  --dry-run                   Generate configs and print commands without training
+  -h, --help                  Show this help
+EOF
+}
+
+require_positive_int() {
+    local flag="$1" value="$2"
+    if ! [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Invalid ${flag} value: ${value} (must be a positive integer)" >&2
+        exit 1
+    fi
+}
+
+require_positive_number() {
+    local flag="$1" value="$2"
+    if ! [[ "${value}" =~ ^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$ ]] || \
+       ! awk -v v="${value}" 'BEGIN { exit !(v > 0) }'; then
+        echo "Invalid ${flag} value: ${value} (must be > 0)" >&2
+        exit 1
+    fi
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --gpus) NUM_GPUS="$2"; shift
-                if [[ "${NUM_GPUS}" -ge 2 ]]; then
-                    ACCEL_CONFIG="${ACCEL_CONFIG_2GPU}"
-                fi ;;
-        --phase4-steps) PHASE4_STEPS="$2"; shift ;;
+        --mode|--finetuning-mode) FINETUNE_SELECTION="$2"; shift ;;
+        --gpus) NUM_GPUS="$2"; shift ;;
+        --batch-size|--per-device-train-batch-size) TRAIN_BATCH_SIZE="$2"; shift ;;
         --gas|--gradient-accumulation-steps)
-            GRAD_ACCUM_STEPS="$2"; shift
-            if ! [[ "${GRAD_ACCUM_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
-                echo "Invalid --gas value: ${GRAD_ACCUM_STEPS} (must be positive integer)"
-                exit 1
-            fi ;;
+            GRAD_ACCUM_STEPS="$2"; shift ;;
+        --steps|--max-steps) PHASE4_STEPS="$2"; shift ;;
+        --warmup-steps|--warmup-skip) WARMUP_SKIP="$2"; shift ;;
+        --learning-rate) LEARNING_RATE="$2"; shift ;;
+        --lora-rank) LORA_RANK="$2"; shift ;;
+        --lora-alpha) LORA_ALPHA="$2"; shift ;;
+        --gpu-bf16-tflops) GPU_BF16_TFLOPS="$2"; shift ;;
+        --cpu-bf16-tflops) CPU_BF16_TFLOPS="$2"; shift ;;
+        --gpu-memory-gbps) GPU_MEMORY_GBPS="$2"; shift ;;
+        --cpu-memory-gbps) CPU_MEMORY_GBPS="$2"; shift ;;
         --dry-run) DRY_RUN=1 ;;
-        *) echo "Unknown argument: $1"; exit 1 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
     esac
     shift
 done
 
-RUN_LABEL="${NUM_GPUS}gpu_${BACKEND_LABEL}"
+case "${FINETUNE_SELECTION}" in
+    both|full|lora) ;;
+    *) echo "Invalid --mode: ${FINETUNE_SELECTION} (expected both, full, or lora)" >&2; exit 1 ;;
+esac
+require_positive_int "--gpus" "${NUM_GPUS}"
+require_positive_int "--batch-size" "${TRAIN_BATCH_SIZE}"
+require_positive_int "--gas" "${GRAD_ACCUM_STEPS}"
+require_positive_int "--steps" "${PHASE4_STEPS}"
+require_positive_int "--lora-rank" "${LORA_RANK}"
+require_positive_int "--lora-alpha" "${LORA_ALPHA}"
+if ! [[ "${WARMUP_SKIP}" =~ ^[0-9]+$ ]] || [[ "${WARMUP_SKIP}" -ge "${PHASE4_STEPS}" ]]; then
+    echo "Invalid --warmup-steps: ${WARMUP_SKIP} (must be >= 0 and < --steps ${PHASE4_STEPS})" >&2
+    exit 1
+fi
+if [[ "${NUM_GPUS}" -eq 1 ]]; then
+    ACCEL_CONFIG="${ACCEL_CONFIG_1GPU}"
+elif [[ "${NUM_GPUS}" -eq 2 ]]; then
+    ACCEL_CONFIG="${ACCEL_CONFIG_2GPU}"
+elif [[ "${NUM_GPUS}" -eq 4 ]]; then
+    ACCEL_CONFIG="${ACCEL_CONFIG_4GPU}"
+else
+    echo "Unsupported --gpus ${NUM_GPUS}: matching configs exist only for 1, 2 and 4 GPUs" >&2
+    exit 1
+fi
+for item in \
+    "--learning-rate:${LEARNING_RATE}" \
+    "--gpu-bf16-tflops:${GPU_BF16_TFLOPS}" \
+    "--cpu-bf16-tflops:${CPU_BF16_TFLOPS}" \
+    "--gpu-memory-gbps:${GPU_MEMORY_GBPS}" \
+    "--cpu-memory-gbps:${CPU_MEMORY_GBPS}"; do
+    require_positive_number "${item%%:*}" "${item#*:}"
+done
+
+RUN_LABEL="${NUM_GPUS}gpu_${BACKEND_LABEL}_${FINETUNE_SELECTION^^}"
 
 # --------------------------------------------------------------------------- #
 # Colored output
@@ -162,6 +248,15 @@ check_env() {
     phase_banner "Environment Check"
 
     log "Python version: $(${PYTHON} --version 2>&1)"
+
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        warn "Dry-run: GPU driver, model, dataset and Python package checks are skipped"
+        for cfg_file in "${TRAIN_CONFIG_BASE}" "${ACCEL_CONFIG}" "${FLOPS_ANALYZE_SCRIPT}"; do
+            [[ -e "${cfg_file}" ]] || { error "Required file not found: ${cfg_file}"; exit 1; }
+        done
+        ok "Static environment check passed"
+        return 0
+    fi
 
     if ! command -v nvidia-smi &>/dev/null; then
         error "nvidia-smi not found, please verify CUDA driver is installed"
@@ -235,7 +330,7 @@ check_env() {
 # Resource estimation
 # --------------------------------------------------------------------------- #
 estimate_resources() {
-    phase_banner "Resource and Time Estimation (Qwen3-30B-A3B FFT, AMXBF16)"
+    phase_banner "Shared Test Parameters (Qwen3-30B-A3B, AMXBF16)"
 
     echo -e "${BOLD}== Model Architecture ==${NC}"
     echo "  Architecture : Qwen3MoeForCausalLM  (pure text MoE)"
@@ -245,69 +340,68 @@ estimate_resources() {
     echo "  Weight source: ${MODEL_PATH}"
     echo ""
 
-    echo -e "${BOLD}== GPU Memory Estimation (${NUM_GPUS} x RTX 4090, 24 GB each) ==${NC}"
-    echo "  AMXBF16: expert weights on CPU (BF16, ~58 GB); GPU holds non-expert params only"
-    echo "  Non-expert GPU params (attention + embed + shared expert): ~6 GB total"
-    if [[ "${NUM_GPUS}" -eq 1 ]]; then
-        echo "  Single-GPU FSDP (no sharding): full ~6 GB params on 1 card"
-        echo "  + activations (seq=1024, grad-ckpt): ~4-6 GB"
-        echo "  + gradients: ~6 GB"
-        echo "  + AdamW optimizer (non-expert): ~12 GB"
-        echo "  ──────────────────────────────────────────────"
-        echo "  Estimated peak VRAM / card: ~20-24 GB  (close to 24 GB limit)"
-        warn "  Single card may OOM — script will auto-retry with 2 GPUs if that happens"
-    else
-        echo "  2-GPU FSDP sharding: ~3 GB params per card"
-        echo "  + activations (seq=1024, grad-ckpt): ~4-6 GB"
-        echo "  + gradients: ~3 GB"
-        echo "  + optimizer: ~6 GB"
-        echo "  ──────────────────────────────────────────────"
-        echo "  Estimated peak VRAM / card: ~12-18 GB  (comfortable)"
-    fi
-    echo ""
-
-    echo -e "${BOLD}== CPU Memory Estimation (2 NUMA nodes) ==${NC}"
-    echo "  BF16 expert weights (per NUMA copy): ~58 GB × 2 NUMA ≈ ~116 GB"
-    echo "  BF16 expert gradient buffers: ~58 GB"
-    echo "  AdamW expert optimizer states (m+v): ~116 GB"
-    echo "  NUMA backward working buffers (tp_part 0+1): ~30-50 GB"
-    echo "  ──────────────────────────────────────────────"
-    if [[ "${NUM_GPUS}" -eq 1 ]]; then
-        echo "  Estimated CPU memory peak: ~400-450 GB  (1 process, 2 NUMA)"
-    else
-        echo "  Estimated CPU memory peak: ~500-600 GB  (2 processes × 2 NUMA overhead)"
-    fi
-    echo ""
-
-    echo -e "${BOLD}== TPS Measurement ==${NC}"
+    echo -e "${BOLD}== Fair-comparison configuration ==${NC}"
+    echo "  Selection: ${FINETUNE_SELECTION} (both executes full -> lora)"
+    echo "  Accelerate config: $(basename "${ACCEL_CONFIG}")"
+    echo "  Per-device batch: ${TRAIN_BATCH_SIZE}"
     echo "  Dataset: 100 samples, all truncated to exactly ${CUTOFF_LEN} tokens"
     echo "  GAS (gradient_accumulation_steps): ${GRAD_ACCUM_STEPS}"
-    echo "  Tokens per optimizer step: ${NUM_GPUS} GPU(s) × ${CUTOFF_LEN} × GAS=${GRAD_ACCUM_STEPS} = $((NUM_GPUS * CUTOFF_LEN * GRAD_ACCUM_STEPS)) tokens"
-    echo "  Warmup steps excluded: ${WARMUP_SKIP}"
-    echo "  TPS = $((NUM_GPUS * CUTOFF_LEN * GRAD_ACCUM_STEPS)) / avg_stable_step_time"
+    echo "  Learning rate: ${LEARNING_RATE}"
+    echo "  Steps: ${PHASE4_STEPS}; stable interval: steps $((WARMUP_SKIP + 1))-${PHASE4_STEPS}"
+    echo "  Tokens per optimizer step: ${NUM_GPUS} GPU(s) × batch=${TRAIN_BATCH_SIZE} × ${CUTOFF_LEN} × GAS=${GRAD_ACCUM_STEPS} = $((NUM_GPUS * TRAIN_BATCH_SIZE * CUTOFF_LEN * GRAD_ACCUM_STEPS)) tokens"
+    echo "  TPS = $((NUM_GPUS * TRAIN_BATCH_SIZE * CUTOFF_LEN * GRAD_ACCUM_STEPS)) / avg_stable_step_time"
+    echo "  Roofline peaks: GPU=${GPU_BF16_TFLOPS} TFLOPS/card; CPU=${CPU_BF16_TFLOPS} TFLOPS"
     echo ""
 }
 
 # --------------------------------------------------------------------------- #
-# Create dated run directory + event FIFO
+# Create one session directory, then a distinct task directory per method.
 # --------------------------------------------------------------------------- #
-setup_run_dir() {
+setup_session_dir() {
     RUN_TS=$(run_timestamp)
     RUN_TIME="$(run_time_display)"
     RUN_TIMEZONE="$(date '+%Z %z')"
-    RUN_LABEL="${NUM_GPUS}gpu_${BACKEND_LABEL}"
-    LOG_DIR="${LOG_BASE}/${RUN_TS}_${RUN_LABEL}"
+    local order_label="${FINETUNE_SELECTION^^}"
+    [[ "${FINETUNE_SELECTION}" == "both" ]] && order_label="FULL_THEN_LORA"
+    RUN_LABEL="${NUM_GPUS}gpu_${BACKEND_LABEL}_${order_label}"
+    SESSION_DIR="${LOG_BASE}/${RUN_TS}_${RUN_LABEL}"
+    mkdir -p "${SESSION_DIR}"
+    log "Session directory: ${SESSION_DIR}"
+
+    export RUN_TS RUN_TIME RUN_TIMEZONE RUN_LABEL SESSION_DIR
+}
+
+setup_task_dir() {
+    FT_MODE="$1"
+    case "${FT_MODE}" in
+        full)
+            FT_LOG_TAG="full_ft"
+            FT_DISPLAY_NAME="全量微调 (Full FT)"
+            ;;
+        lora)
+            FT_LOG_TAG="lora_ft"
+            FT_DISPLAY_NAME="LoRA 微调"
+            ;;
+        *) error "Internal error: invalid fine-tuning mode ${FT_MODE}"; return 1 ;;
+    esac
+
+    LOG_DIR="${SESSION_DIR}/${FT_LOG_TAG}"
+    TRAIN_LOG_NAME="train_${FT_LOG_TAG}.log"
+    MONITOR_FIFO="/tmp/qwen3_ft_monitor_$$_${FT_LOG_TAG}.fifo"
     mkdir -p "${LOG_DIR}/plots"
-    log "Log directory: ${LOG_DIR}"
+    log "Task log directory (${FT_MODE}): ${LOG_DIR}"
 
-    [[ -p "${MONITOR_FIFO}" ]] && rm -f "${MONITOR_FIFO}"
-    mkfifo "${MONITOR_FIFO}"
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        [[ -p "${MONITOR_FIFO}" ]] && rm -f "${MONITOR_FIFO}"
+        mkfifo "${MONITOR_FIFO}"
+    fi
 
-    export LOG_DIR RUN_TS RUN_TIME RUN_TIMEZONE RUN_LABEL MONITOR_FIFO
+    export LOG_DIR MONITOR_FIFO FT_MODE FT_LOG_TAG FT_DISPLAY_NAME TRAIN_LOG_NAME
 }
 
 send_event() {
     local msg="$1"
+    [[ "${DRY_RUN}" -eq 1 ]] && return 0
     if [[ -p "${MONITOR_FIFO}" ]]; then
         echo "${msg}" >> "${MONITOR_FIFO}" 2>/dev/null || true
     fi
@@ -338,6 +432,8 @@ stop_monitor() {
         wait "${MONITOR_PID}" 2>/dev/null || true
         MONITOR_PID=""
     fi
+    [[ -n "${MONITOR_FIFO}" && -p "${MONITOR_FIFO}" ]] && rm -f "${MONITOR_FIFO}"
+    return 0
 }
 
 # --------------------------------------------------------------------------- #
@@ -346,9 +442,6 @@ stop_monitor() {
 # regardless of save_strategy.  Each saved checkpoint is ~115 GB for this
 # model, so we delete it immediately after a phase no longer needs it.
 #
-# Expert-update verification does NOT depend on this checkpoint: it samples
-# KT gate/up/down_proj_buf during training (see expert_buf_probe.py). HF
-# checkpoint expert weights are zero-storage placeholders and are not used.
 # --------------------------------------------------------------------------- #
 cleanup_model_output() {
     local phase_name="$1"
@@ -394,14 +487,15 @@ make_phase_config() {
 }
 
 # --------------------------------------------------------------------------- #
-# Run a single accelerate training command
-# Supports OOM auto-fallback from 1 GPU to 2 GPUs (one retry only).
+# Run a single accelerate training command.  There is deliberately no
+# mode-dependent OOM fallback: changing GPU count for only one method would
+# invalidate a Full-vs-LoRA throughput comparison.
 # --------------------------------------------------------------------------- #
 run_train() {
     local phase_name="$1"
     local desc="$2"
     local train_cfg="$3"
-    local phase_log="${LOG_DIR}/${phase_name}/train.log"
+    local phase_log="${LOG_DIR}/${phase_name}/${TRAIN_LOG_NAME}"
     local exit_code=0
 
     log "Starting training [${phase_name}]: ${desc}"
@@ -416,30 +510,18 @@ run_train() {
     local accelerate_bin="${CONDA_BIN_DIR}/accelerate"
     [[ ! -x "${accelerate_bin}" ]] && accelerate_bin="accelerate"
 
-    local probe_out="${LOG_DIR}/${phase_name}/expert_buf_probe.json"
-    local grad_probe_out="${LOG_DIR}/${phase_name}/expert_grad_probe.json"
     local timing_dir="${LOG_DIR}/${phase_name}/step_timing"
     local cmd=(
         env
         USE_KT=1
         ACCELERATE_USE_KT=true
-        ACCELERATE_KT_TRAIN_MODE=full
-        KT_EXPERT_BUF_PROBE=1
-        KT_EXPERT_BUF_PROBE_OUT="${probe_out}"
-        KT_EXPERT_BUF_PROBE_SAMPLES="${EXPERT_CHECK_SAMPLES}"
-        KT_EXPERT_BUF_PROBE_SEED="${EXPERT_CHECK_SEED}"
-        KT_EXPERT_BUF_PROBE_ATOL="${EXPERT_CHECK_ATOL}"
-        KT_EXPERT_GRAD_PROBE=1
-        KT_EXPERT_GRAD_PROBE_OUT="${grad_probe_out}"
+        ACCELERATE_KT_TRAIN_MODE="${FT_MODE}"
+        KT_FINETUNE_MODE="${FT_MODE}"
         KT_STEP_TIMING=1
         KT_STEP_TIMING_OUT_DIR="${timing_dir}"
         KT_STEP_TIMING_WARMUP_SKIP="${WARMUP_SKIP}"
-        KT_STEP_TIMING_TOKENS_PER_STEP="$((NUM_GPUS * CUTOFF_LEN * GRAD_ACCUM_STEPS))"
-        KT_STALL_WATCH=1
-        KT_STALL_WATCH_OUT_DIR="${timing_dir}"
-        KT_STALL_WATCH_IDLE_SEC="${STALL_WATCH_IDLE_SEC:-5}"
-        KT_STALL_WATCH_PHASES="${STALL_WATCH_PHASES:-optimizer,backward,post_optim}"
-        PYTHONPATH="${PROBE_MODULE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+        KT_STEP_TIMING_TOKENS_PER_STEP="$((NUM_GPUS * TRAIN_BATCH_SIZE * CUTOFF_LEN * GRAD_ACCUM_STEPS))"
+        PYTHONPATH="${TIMING_MODULE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
         CUDA_VISIBLE_DEVICES="${gpus_str}"
         "${accelerate_bin}" launch
         --config_file "${ACCEL_CONFIG}"
@@ -461,63 +543,6 @@ run_train() {
 
     send_event "event:train_end"
 
-    # ---- OOM auto-fallback: 1 GPU → 2 GPUs (one attempt only) ----
-    if [[ "${exit_code}" -ne 0 ]] && [[ "${OOM_FALLBACK_DONE}" -eq 0 ]]; then
-        if grep -qi "out of memory\|cuda error.*out of memory\|oom\|cudamalloc failed" "${phase_log}" 2>/dev/null; then
-            if [[ "${NUM_GPUS}" -eq 1 ]]; then
-                warn "OOM detected on single GPU — switching to 2-GPU config and retrying..."
-                NUM_GPUS=2
-                ACCEL_CONFIG="${ACCEL_CONFIG_2GPU}"
-                OOM_FALLBACK_DONE=1
-
-                # Rename current log, retry in the same phase dir
-                mv "${phase_log}" "${phase_log%.log}_oom_1gpu.log"
-                log "Retrying [${phase_name}] with 2 GPUs..."
-
-                gpus_str=$(seq 0 $((NUM_GPUS - 1)) | paste -sd ',')
-                cmd=(
-                    env
-                    USE_KT=1
-                    ACCELERATE_USE_KT=true
-                    ACCELERATE_KT_TRAIN_MODE=full
-                    KT_EXPERT_BUF_PROBE=1
-                    KT_EXPERT_BUF_PROBE_OUT="${probe_out}"
-                    KT_EXPERT_BUF_PROBE_SAMPLES="${EXPERT_CHECK_SAMPLES}"
-                    KT_EXPERT_BUF_PROBE_SEED="${EXPERT_CHECK_SEED}"
-                    KT_EXPERT_BUF_PROBE_ATOL="${EXPERT_CHECK_ATOL}"
-                    KT_EXPERT_GRAD_PROBE=1
-                    KT_EXPERT_GRAD_PROBE_OUT="${grad_probe_out}"
-                    KT_STEP_TIMING=1
-                    KT_STEP_TIMING_OUT_DIR="${timing_dir}"
-                    KT_STEP_TIMING_WARMUP_SKIP="${WARMUP_SKIP}"
-                    KT_STEP_TIMING_TOKENS_PER_STEP="$((NUM_GPUS * CUTOFF_LEN * GRAD_ACCUM_STEPS))"
-                    KT_STALL_WATCH=1
-                    KT_STALL_WATCH_OUT_DIR="${timing_dir}"
-                    KT_STALL_WATCH_IDLE_SEC="${STALL_WATCH_IDLE_SEC:-5}"
-                    KT_STALL_WATCH_PHASES="${STALL_WATCH_PHASES:-optimizer,backward,post_optim}"
-                    PYTHONPATH="${PROBE_MODULE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
-                    CUDA_VISIBLE_DEVICES="${gpus_str}"
-                    "${accelerate_bin}" launch
-                    --config_file "${ACCEL_CONFIG}"
-                    -m "${TRAIN_ENTRY_MODULE}" train
-                    "${train_cfg}"
-                )
-                pushd "${LLAMA_FACTORY_DIR}" > /dev/null
-                set +e
-                "${cmd[@]}" 2>&1 | tee "${phase_log}"
-                exit_code=${PIPESTATUS[0]}
-                set -e
-                popd > /dev/null
-
-                if [[ "${exit_code}" -eq 0 ]]; then
-                    ok "2-GPU retry succeeded for [${phase_name}]"
-                else
-                    error "2-GPU retry also failed for [${phase_name}] (exit code ${exit_code})"
-                fi
-            fi
-        fi
-    fi
-
     return "${exit_code}"
 }
 
@@ -526,7 +551,7 @@ run_train() {
 # --------------------------------------------------------------------------- #
 analyze_log() {
     local phase_name="$1"
-    local log_file="${LOG_DIR}/${phase_name}/train.log"
+    local log_file="${LOG_DIR}/${phase_name}/${TRAIN_LOG_NAME}"
     local result_file="${LOG_DIR}/${phase_name}/log_analysis.txt"
 
     [[ ! -f "${log_file}" ]] && return
@@ -583,7 +608,7 @@ analyze_log() {
 generate_memory_component_estimate() {
     phase_banner "Memory Component Attribution Estimate"
 
-    "${PYTHON}" - "${MODEL_PATH}" "${NUM_GPUS}" "${CUTOFF_LEN}" "${LOG_DIR}" <<'PYEOF' \
+    "${PYTHON}" - "${MODEL_PATH}" "${NUM_GPUS}" "${CUTOFF_LEN}" "${LOG_DIR}" "${FT_MODE}" "${LORA_RANK}" <<'PYEOF' \
         | tee "${LOG_DIR}/memory_component_estimate.txt"
 import json
 import sys
@@ -593,6 +618,8 @@ model_path = Path(sys.argv[1])
 num_gpus = int(sys.argv[2])
 cutoff_len = int(sys.argv[3])
 log_dir = Path(sys.argv[4])
+mode = sys.argv[5]
+lora_rank = int(sys.argv[6])
 
 def gb(n: float) -> float:
     return n / 1e9
@@ -610,6 +637,7 @@ if cache_path.exists():
         cache = {}
 
 H = int(cfg["hidden_size"])
+shared_i = int(cfg.get("intermediate_size", 0) or 0)
 moe_i = int(cfg["moe_intermediate_size"])
 E = int(cfg["num_experts"])
 L = int(cfg["num_hidden_layers"])
@@ -618,8 +646,13 @@ V = int(cfg["vocab_size"])
 
 expert_params = E * 3 * H * moe_i * L
 expert_weight_bytes = expert_params * 2
-expert_grad_bytes = expert_params * 4
-expert_adam_bytes = expert_params * 8
+if mode == "full":
+    expert_trainable_params = expert_params
+else:
+    # gate/up: H->moe_i; down: moe_i->H, for all expert adapters.
+    expert_trainable_params = L * E * lora_rank * (4 * H + 2 * moe_i)
+expert_grad_bytes = expert_trainable_params * 4
+expert_adam_bytes = expert_trainable_params * 8
 
 rest_gib = float(cache.get("rest_size_gb", 0.0) or 0.0)
 if rest_gib > 0:
@@ -642,8 +675,20 @@ else:
     non_expert_source = "config fallback"
 
 gpu_model_weights = gb(non_expert_weight_bytes / num_gpus)
-gpu_gradients = gb((non_expert_weight_bytes / 2) * 4 / num_gpus)
-gpu_optimizer = gb((non_expert_weight_bytes / 2) * 8 / num_gpus)
+if mode == "full":
+    gpu_trainable_params = non_expert_weight_bytes / 2
+else:
+    head_dim = int(cfg.get("head_dim", H // int(cfg["num_attention_heads"])))
+    nh = int(cfg["num_attention_heads"])
+    nkv = int(cfg["num_key_value_heads"])
+    q_out = nh * head_dim
+    kv_out = nkv * head_dim
+    attn_dims = (H + q_out) + 2 * (H + kv_out) + (q_out + H)
+    shared_dims = 2 * (H + shared_i) + (shared_i + H)
+    router_dims = H + E
+    gpu_trainable_params = L * lora_rank * (attn_dims + shared_dims + router_dims)
+gpu_gradients = gb(gpu_trainable_params * 4 / num_gpus)
+gpu_optimizer = gb(gpu_trainable_params * 8 / num_gpus)
 gpu_activations = 2.0
 
 estimate = {
@@ -655,6 +700,8 @@ estimate = {
     ],
     "model": {
         "path": str(model_path),
+        "finetuning_mode": mode,
+        "lora_rank": lora_rank if mode == "lora" else 0,
         "hidden_size": H,
         "num_layers": L,
         "num_experts": E,
@@ -685,6 +732,7 @@ estimate = {
 
 print("=== Memory Component Attribution Estimate ===")
 print(f"model_path          : {model_path}")
+print(f"finetuning_mode     : {mode}")
 print(f"architecture        : {cfg.get('architectures', ['?'])[0]}")
 print(f"layers/experts/topk : {L} / {E} / {top_k}")
 print(f"cutoff_len          : {cutoff_len}")
@@ -875,162 +923,46 @@ print("  Exact optimizer/gradient ownership requires instrumentation inside the 
 PYEOF
 }
 
-verify_expert_weight_changes() {
-    phase_banner "Expert Base-Weight Probe (in-training proj_buf sample)"
-
-    local probe_json="${LOG_DIR}/phase4/expert_buf_probe.json"
-    local report_txt="${LOG_DIR}/expert_weight_change_check.txt"
-    local report_json="${LOG_DIR}/expert_weight_change_check.json"
-
-    "${PYTHON}" - \
-        "${probe_json}" \
-        "${report_json}" <<'PYEOF' | tee "${report_txt}"
-import json
-import shutil
-import sys
-from pathlib import Path
-
-probe_path = Path(sys.argv[1])
-report_json = Path(sys.argv[2])
-
-print("=== Expert Base-Weight Probe (in-training) ===")
-print("method                 : sample gate/up/down_proj_buf at train_begin vs train_end")
-print("note                   : does NOT use HF checkpoint expert weights")
-print(f"probe_json             : {probe_path}")
-
-if not probe_path.exists():
-    obj = {
-        "status": "ERROR",
-        "reason": "in-training probe JSON missing; callback may not have been installed or training failed before train_end",
-        "method": "in_training_proj_buf_sample",
-        "sampled_tensors": 0,
-        "changed_tensors": 0,
-    }
-    report_json.write_text(json.dumps(obj, indent=2, ensure_ascii=False))
-    print(f"status                 : {obj['status']}")
-    print(f"reason                 : {obj['reason']}")
-    raise SystemExit(0)
-
-data = json.loads(probe_path.read_text())
-shutil.copyfile(probe_path, report_json)
-
-print(f"status                 : {data.get('status')}")
-print(f"reason                 : {data.get('reason', '')}")
-print(f"sampled_tensors        : {data.get('sampled_tensors', 0)}")
-print(f"changed_tensors        : {data.get('changed_tensors', 0)}")
-print(f"nonfinite_tensors      : {data.get('nonfinite_tensors', 0)}")
-agg = data.get("aggregate") or {}
-for key in (
-    "changed_tensor_fraction",
-    "mean_rel_l2_delta",
-    "max_rel_l2_delta",
-    "mean_max_abs_delta",
-    "max_abs_delta",
-):
-    if key in agg:
-        print(f"{key:23s}: {agg[key]:.8e}")
-print(f"json                   : {report_json}")
-
-print()
-print("--- Sampled expert buffers ---")
-for r in data.get("records", []):
-    if r.get("status") != "OK":
-        print(f"{r.get('tensor')} | {r.get('status')} | {r.get('reason', '')}")
-        continue
-    print(
-        f"{r['tensor']} | changed={r.get('changed')} | "
-        f"rel_l2={r.get('rel_l2_delta', float('nan')):.8e} | "
-        f"max_abs={r.get('max_abs_delta', float('nan')):.8e} | "
-        f"changed_frac={r.get('changed_element_fraction', 0.0):.8e} | "
-        f"finite_after={r.get('finite_after')}"
-    )
-PYEOF
-}
-
-verify_expert_gradients() {
-    phase_banner "Expert Gradient Probe (pre-optimizer full scan)"
-
-    local probe_json="${LOG_DIR}/phase4/expert_grad_probe.json"
-    local report_txt="${LOG_DIR}/expert_gradient_check.txt"
-    local report_json="${LOG_DIR}/expert_gradient_check.json"
-
-    "${PYTHON}" - "${probe_json}" "${report_json}" <<'PYEOF' | tee "${report_txt}"
-import json
-import shutil
-import sys
-from pathlib import Path
-
-probe_path = Path(sys.argv[1])
-report_json = Path(sys.argv[2])
-
-print("=== Expert Gradient Probe (pre-optimizer) ===")
-print("method                 : full scan of grad_*_proj_buf and corresponding Parameter.grad")
-print(f"probe_json             : {probe_path}")
-
-if not probe_path.exists():
-    obj = {
-        "status": "ERROR",
-        "reason": "expert gradient probe JSON missing; training may have failed before optimizer step",
-        "method": "pre_optimizer_full_expert_gradient_scan",
-        "steps": [],
-    }
-    report_json.write_text(json.dumps(obj, indent=2, ensure_ascii=False))
-    print(f"status                 : {obj['status']}")
-    print(f"reason                 : {obj['reason']}")
-    raise SystemExit(0)
-
-data = json.loads(probe_path.read_text())
-shutil.copyfile(probe_path, report_json)
-print(f"status                 : {data.get('status')}")
-print(f"reason                 : {data.get('reason', '')}")
-print(f"steps_recorded         : {len(data.get('steps') or [])}")
-print(f"json                   : {report_json}")
-
-for step in data.get("steps") or []:
-    summary = step.get("summary") or {}
-    print()
-    print(f"--- optimizer step {step.get('optimizer_step')} ---")
-    print(f"learning_rates         : {step.get('learning_rates', [])}")
-    print(f"nonzero_grad_buffers   : {summary.get('nonzero_grad_buffers', 0)}/{summary.get('ok_records', 0)}")
-    print(f"parameter_grads_present: {summary.get('parameter_grads_present', 0)}/{summary.get('ok_records', 0)}")
-    print(f"nonzero_parameter_grads: {summary.get('nonzero_parameter_grads', 0)}/{summary.get('ok_records', 0)}")
-    print(f"nonfinite_grad_buffers : {summary.get('nonfinite_grad_buffers', 0)}")
-    print(f"nonfinite_param_grads  : {summary.get('nonfinite_parameter_grads', 0)}")
-    print(f"max_abs_grad_buffer    : {summary.get('max_abs_grad_buffer', 0.0):.8e}")
-    print(f"max_abs_parameter_grad : {summary.get('max_abs_parameter_grad', 0.0):.8e}")
-    for proj, proj_stats in (summary.get("projection_summary") or {}).items():
-        print(
-            f"  {proj}: buffer_nonzero={proj_stats.get('nonzero_grad_buffers', 0)}/{proj_stats.get('records', 0)} "
-            f"param_nonzero={proj_stats.get('nonzero_parameter_grads', 0)}/{proj_stats.get('records', 0)}"
-            f" max_abs_buffer={proj_stats.get('max_abs_grad_buffer', 0.0):.8e}"
-            f" max_abs_param={proj_stats.get('max_abs_parameter_grad', 0.0):.8e}"
-        )
-PYEOF
-}
-
 # --------------------------------------------------------------------------- #
 # Phase 4: Stability extension + accurate TPS measurement
 # --------------------------------------------------------------------------- #
 run_phase4() {
-    phase_banner "Phase 4: Stability Extension + TPS Benchmark (${PHASE4_STEPS} steps)"
+    phase_banner "${FT_DISPLAY_NAME}: TPS + Step Timing (${PHASE4_STEPS} steps)"
     local cfg
-    cfg=$(make_phase_config "phase4" \
-        "max_steps=${PHASE4_STEPS}" \
-        "gradient_accumulation_steps=${GRAD_ACCUM_STEPS}" \
-        "save_strategy='no'" \
-        "logging_steps=1")
+    local config_overrides=(
+        "max_steps=${PHASE4_STEPS}"
+        "per_device_train_batch_size=${TRAIN_BATCH_SIZE}"
+        "gradient_accumulation_steps=${GRAD_ACCUM_STEPS}"
+        "learning_rate=${LEARNING_RATE}"
+        "finetuning_type=${FT_MODE}"
+        "save_strategy='no'"
+        "logging_steps=1"
+    )
+    if [[ "${FT_MODE}" == "lora" ]]; then
+        config_overrides+=(
+            "lora_rank=${LORA_RANK}"
+            "lora_alpha=${LORA_ALPHA}"
+            "lora_target=all"
+        )
+    fi
+    cfg=$(make_phase_config "phase4" "${config_overrides[@]}")
 
-    log "Steps: ${PHASE4_STEPS}  |  GPUs: ${NUM_GPUS}  |  cutoff_len: ${CUTOFF_LEN}  |  GAS: ${GRAD_ACCUM_STEPS}"
+    log "Mode: ${FT_MODE}  |  steps: ${PHASE4_STEPS}  |  GPUs: ${NUM_GPUS}  |  batch: ${TRAIN_BATCH_SIZE}  |  cutoff_len: ${CUTOFF_LEN}  |  GAS: ${GRAD_ACCUM_STEPS}"
     log "TPS measurement: skipping first ${WARMUP_SKIP} warmup steps"
-    log "tokens/optimizer-step = ${NUM_GPUS} × ${CUTOFF_LEN} × ${GRAD_ACCUM_STEPS} = $((NUM_GPUS * CUTOFF_LEN * GRAD_ACCUM_STEPS))"
-    log "Exposes: P2 (CPU speed), P4 (MoE load), P5 (NaN), P6 (Router), P7 (re-quantize)"
+    log "tokens/optimizer-step = ${NUM_GPUS} × ${TRAIN_BATCH_SIZE} × ${CUTOFF_LEN} × ${GRAD_ACCUM_STEPS} = $((NUM_GPUS * TRAIN_BATCH_SIZE * CUTOFF_LEN * GRAD_ACCUM_STEPS))"
+    log "Performance-only run: expert probes and GDB are disabled"
 
     local t_start
     t_start=$(date +%s)
     send_event "phase:phase4"
 
     local exit_code=0
-    run_train "phase4" "stability + TPS benchmark (${PHASE4_STEPS} steps)" "${cfg}" || exit_code=$?
+    run_train "phase4" "${FT_MODE} TPS benchmark (${PHASE4_STEPS} steps)" "${cfg}" || exit_code=$?
+
+    echo "${exit_code}" > "${LOG_DIR}/phase4/exit_code.txt"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        return "${exit_code}"
+    fi
 
     local t_end
     t_end=$(date +%s)
@@ -1041,8 +973,8 @@ run_phase4() {
         echo "Total wall time: ${total_sec} seconds"
 
         local actual_steps
-        actual_steps=$(grep -c "{'loss'" "${LOG_DIR}/phase4/train.log" 2>/dev/null || \
-                       grep -c '"loss"' "${LOG_DIR}/phase4/train.log" 2>/dev/null || echo 0)
+        actual_steps=$(grep -c "{'loss'" "${LOG_DIR}/phase4/${TRAIN_LOG_NAME}" 2>/dev/null || \
+                       grep -c '"loss"' "${LOG_DIR}/phase4/${TRAIN_LOG_NAME}" 2>/dev/null || echo 0)
         echo "steps_completed: ${actual_steps} (expected ${PHASE4_STEPS})"
 
         if [[ "${actual_steps}" -gt 0 ]]; then
@@ -1057,11 +989,12 @@ run_phase4() {
         # ------------------------------------------------------------------- #
         echo "--- Accurate TPS (warmup excluded) ---"
         "${PYTHON}" - \
-            "${LOG_DIR}/phase4/train.log" \
+            "${LOG_DIR}/phase4/${TRAIN_LOG_NAME}" \
             "${CUTOFF_LEN}" \
             "${NUM_GPUS}" \
             "${WARMUP_SKIP}" \
-            "${GRAD_ACCUM_STEPS}" <<'PYEOF'
+            "${GRAD_ACCUM_STEPS}" \
+            "${TRAIN_BATCH_SIZE}" <<'PYEOF'
 import re, sys, statistics
 
 log_path   = sys.argv[1]
@@ -1069,6 +1002,7 @@ cutoff_len = int(sys.argv[2])
 num_gpus   = int(sys.argv[3])
 warmup_n   = int(sys.argv[4])
 gas        = int(sys.argv[5])
+batch_size = int(sys.argv[6])
 
 try:
     log_text = open(log_path, errors="replace").read()
@@ -1091,14 +1025,15 @@ for step_num, step_time in steps:
     seen[step_num] = step_time
 steps_dedup = sorted(seen.items())
 
-tokens_per_step = num_gpus * cutoff_len * gas
+tokens_per_step = num_gpus * batch_size * cutoff_len * gas
 stable = [(s, t) for s, t in steps_dedup if s > warmup_n]
 
 print(f"  total_steps_logged : {len(steps_dedup)}")
 print(f"  warmup_steps_skip  : {warmup_n}")
 print(f"  stable_steps       : {len(stable)}")
 print(f"  gas                : {gas}")
-print(f"  tokens_per_step    : {tokens_per_step}  ({num_gpus} GPU x {cutoff_len} x GAS={gas})")
+print(f"  batch_size         : {batch_size}")
+print(f"  tokens_per_step    : {tokens_per_step}  ({num_gpus} GPU x batch={batch_size} x {cutoff_len} x GAS={gas})")
 
 if not stable:
     print("  (not enough steps to compute stable TPS)")
@@ -1129,20 +1064,20 @@ PYEOF
         echo ""
         echo "--- MoE router aux loss (P4) ---"
         grep -i "aux_loss\|router_loss\|balance_loss" \
-             "${LOG_DIR}/phase4/train.log" 2>/dev/null | tail -10 || echo "  (no router aux loss found)"
+             "${LOG_DIR}/phase4/${TRAIN_LOG_NAME}" 2>/dev/null | tail -10 || echo "  (no router aux loss found)"
 
         echo ""
         echo "--- update_base_weights call count (P7) ---"
         local upd_count
         upd_count=$(grep -ci "update_base_weights\|re-quantize\|TP_MOE_SFT" \
-                    "${LOG_DIR}/phase4/train.log" 2>/dev/null || echo 0)
+                    "${LOG_DIR}/phase4/${TRAIN_LOG_NAME}" 2>/dev/null || echo 0)
         echo "  update_base_weights triggered: ${upd_count} times"
 
         echo ""
         echo "--- NaN/Inf statistics (P5) ---"
         local nan_cnt inf_cnt
-        nan_cnt=$(grep -ci " nan" "${LOG_DIR}/phase4/train.log" 2>/dev/null || echo 0)
-        inf_cnt=$(grep -ci " inf" "${LOG_DIR}/phase4/train.log" 2>/dev/null || echo 0)
+        nan_cnt=$(grep -ci " nan" "${LOG_DIR}/phase4/${TRAIN_LOG_NAME}" 2>/dev/null || echo 0)
+        inf_cnt=$(grep -ci " inf" "${LOG_DIR}/phase4/${TRAIN_LOG_NAME}" 2>/dev/null || echo 0)
         echo "  NaN lines: ${nan_cnt};  Inf lines: ${inf_cnt}"
         if [[ "${nan_cnt}" -gt 0 ]] || [[ "${inf_cnt}" -gt 0 ]]; then
             warn "=> numerical anomaly detected, check P5 and P6"
@@ -1151,10 +1086,29 @@ PYEOF
     } | tee "${LOG_DIR}/phase4_analysis.txt"
 
     analyze_log "phase4"
-    echo "${exit_code}" > "${LOG_DIR}/phase4/exit_code.txt"
-    verify_expert_gradients
-    verify_expert_weight_changes
+    generate_flops_analysis || true
     cleanup_model_output "phase4"
+    return "${exit_code}"
+}
+
+generate_flops_analysis() {
+    phase_banner "${FT_DISPLAY_NAME}: Theoretical FLOPs Sanity Check"
+    local timing_dir="${LOG_DIR}/phase4/step_timing"
+    "${PYTHON}" "${FLOPS_ANALYZE_SCRIPT}" \
+        --timing-json "${timing_dir}/step_timing.json" \
+        --model-config "${MODEL_PATH}/config.json" \
+        --mode "${FT_MODE}" \
+        --seq-len "${CUTOFF_LEN}" \
+        --batch-size "${TRAIN_BATCH_SIZE}" \
+        --gas "${GRAD_ACCUM_STEPS}" \
+        --gpus "${NUM_GPUS}" \
+        --lora-rank "${LORA_RANK}" \
+        --gpu-bf16-tflops "${GPU_BF16_TFLOPS}" \
+        --cpu-bf16-tflops "${CPU_BF16_TFLOPS}" \
+        --gpu-memory-gbps "${GPU_MEMORY_GBPS}" \
+        --cpu-memory-gbps "${CPU_MEMORY_GBPS}" \
+        --output-dir "${timing_dir}" \
+        | tee "${timing_dir}/flops_analysis.log"
 }
 
 # --------------------------------------------------------------------------- #
@@ -1167,15 +1121,18 @@ generate_summary() {
     rm -f "${LOG_DIR}/SUMMARY.md"
 
     {
-        echo "# Qwen3-30B-A3B FFT 测试报告"
+        echo "# Qwen3-30B-A3B ${FT_DISPLAY_NAME}性能测试报告"
         echo ""
         echo "**测试时间**: ${RUN_TIME}"
         echo "**运行标签**: ${RUN_LABEL}"
+        echo "**微调方式**: ${FT_MODE}"
         echo "**日志目录**: \`${LOG_DIR}\`"
+        echo "**训练日志**: \`${LOG_DIR}/phase4/${TRAIN_LOG_NAME}\`"
         echo "**GPU 数量**: ${NUM_GPUS}（后端: AMXBF16，2 NUMA）"
         echo "**模型**: Qwen3MoeForCausalLM（纯文本，48 层，128 experts）"
         echo "**数据集**: ${DATASET_NAME}（100 条，样本 >7000 tokens，截断至 ${CUTOFF_LEN}）"
-        echo "**GAS**: ${GRAD_ACCUM_STEPS}"
+        echo "**Batch/GAS/学习率**: ${TRAIN_BATCH_SIZE} / ${GRAD_ACCUM_STEPS} / ${LEARNING_RATE}"
+        echo "**性能步数**: ${PHASE4_STEPS}（前 ${WARMUP_SKIP} 步 warmup，后 $((PHASE4_STEPS - WARMUP_SKIP)) 步计算 TPS）"
         echo ""
         echo "## 1. Phase 退出码"
         echo ""
@@ -1219,41 +1176,20 @@ generate_summary() {
         fi
 
         echo ""
-        echo "## 4. Full-FT 逐步计时与停顿检测"
+        echo "## 4. ${FT_DISPLAY_NAME}逐步计时"
         echo ""
         echo "- 逐步 JSON: \`${LOG_DIR}/phase4/step_timing/step_timing.json\`"
         echo "- 逐步 CSV: \`${LOG_DIR}/phase4/step_timing/step_timing.csv\`"
         echo "- 逐步 Markdown: \`${LOG_DIR}/phase4/step_timing/step_timing.md\`"
         echo "- Job 计时 JSON: \`${LOG_DIR}/phase4/step_timing/job_timing.json\`"
-        echo "- 停顿检测: \`${LOG_DIR}/phase4/step_timing/stall_events.md\`"
-        echo ""
-        if [[ -f "${LOG_DIR}/phase4/step_timing/stall_events.json" ]]; then
-            echo "### 停顿检测（Stall Watch）"
-            echo ""
-            "${PYTHON}" - "${LOG_DIR}/phase4/step_timing/stall_events.json" <<'PYEOF'
-import json, sys
-data = json.load(open(sys.argv[1]))
-print(f"- 状态: {data.get('status')}，事件数: {data.get('num_events', 0)}")
-for i, ev in enumerate(data.get("events") or [], 1):
-    vm = ev.get("vmstat_delta") or {}
-    top = sorted(vm.items(), key=lambda kv: abs(kv[1]), reverse=True)[:5]
-    top_s = "，".join(f"{k}={v}" for k, v in top) if top else "无 vmstat 增量"
-    print(
-        f"- 事件{i}: 阶段=`{ev.get('phase')}` step≈{ev.get('global_step_hint')} "
-        f"墙钟={ev.get('wall_sec'):.1f}s CPU增量={ev.get('cpu_delta_sec')} "
-        f"空闲比={ev.get('idle_ratio')}｜{top_s}"
-    )
-if not data.get("events"):
-    print("- 本轮未检测到停顿事件")
-PYEOF
-            echo ""
-        fi
-        "${PYTHON}" - <<PYEOF
+        echo "- 理论 FLOPs JSON: \`${LOG_DIR}/phase4/step_timing/flops_analysis.json\`"
+        echo "- 理论 FLOPs Markdown: \`${LOG_DIR}/phase4/step_timing/flops_analysis.md\`"
+        "${PYTHON}" - <<PYEOF | sed 's/^## /### /'
 import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, "${PROBE_MODULE_DIR}")
+sys.path.insert(0, "${TIMING_MODULE_DIR}")
 from step_timing_probe import (
     parse_job_timing_from_train_log,
     render_summary_timing_section,
@@ -1261,7 +1197,7 @@ from step_timing_probe import (
 
 log_dir = Path("${LOG_DIR}")
 step_path = log_dir / "phase4" / "step_timing" / "step_timing.json"
-train_log = log_dir / "phase4" / "train.log"
+train_log = log_dir / "phase4" / "${TRAIN_LOG_NAME}"
 out_dir = log_dir / "phase4" / "step_timing"
 out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1271,49 +1207,22 @@ if step_path.exists():
 
 job_timing = parse_job_timing_from_train_log(train_log)
 (out_dir / "job_timing.json").write_text(json.dumps(job_timing, indent=2, ensure_ascii=False))
-print(render_summary_timing_section(step_timing, job_timing))
+print(render_summary_timing_section(step_timing, job_timing, finetune_mode="${FT_MODE}"))
 PYEOF
 
-        echo ""
-        echo "## 5. Expert 基座权重变化检查"
-        echo ""
-        echo "- 方法: 训练中采样 KT \`gate/up/down_proj_buf\`（非 HF checkpoint）"
-        echo "- 文本报告: \`${LOG_DIR}/expert_weight_change_check.txt\`"
-        echo "- JSON 报告: \`${LOG_DIR}/expert_weight_change_check.json\`"
-        echo "- 原始 probe: \`${LOG_DIR}/phase4/expert_buf_probe.json\`"
-        echo ""
-        if [[ -f "${LOG_DIR}/expert_weight_change_check.json" ]]; then
-            "${PYTHON}" - "${LOG_DIR}/expert_weight_change_check.json" <<'PYEOF'
-import json
-import sys
-
-data = json.load(open(sys.argv[1]))
-agg = data.get("aggregate", {})
-status = data.get("status", "UNKNOWN")
-status_cn = {"OK": "通过", "FAIL": "未通过", "ERROR": "错误", "SKIPPED": "跳过"}.get(status, status)
-print(f"- 状态: **{status_cn}**（{status}）")
-reason = data.get("reason", "")
-if reason:
-    if "none of the sampled" in reason:
-        reason = "抽样的 expert 基座 buffer 均未超过 atol 变化"
-    elif "probe JSON missing" in reason:
-        reason = "缺少 in-training probe JSON（callback 未安装或训练未到 train_end）"
-    print(f"- 原因: {reason}")
-print(f"- 方法: {data.get('method', 'unknown')}")
-print(f"- 抽样张量: {data.get('sampled_tensors', 0)}")
-print(f"- 发生变化: {data.get('changed_tensors', 0)}")
-print(f"- 非有限值: {data.get('nonfinite_tensors', 0)}")
-if agg:
-    print(f"- changed_tensor_fraction: {agg.get('changed_tensor_fraction', 0.0):.6e}")
-    print(f"- mean_rel_l2_delta: {agg.get('mean_rel_l2_delta', 0.0):.6e}")
-    print(f"- max_abs_delta: {agg.get('max_abs_delta', 0.0):.6e}")
-PYEOF
+        if [[ -f "${LOG_DIR}/phase4/step_timing/flops_analysis.md" ]]; then
+            echo ""
+            sed -e '1s/^# /## 5. /' -e '2,$s/^## /### /' \
+                "${LOG_DIR}/phase4/step_timing/flops_analysis.md"
         else
-            echo "- （未运行 expert 权重检查）"
+            echo ""
+            echo "## 5. 理论 FLOPs 与耗时校验"
+            echo ""
+            echo "- FLOPs 报告不可用；检查训练是否完成 warmup 后的稳定 steps。"
         fi
 
         echo ""
-        echo "## 6. 关键问题检测"
+        echo "## 6. 基础健康检查"
         echo ""
         echo "| 编号 | 问题 | 检测结论 |"
         echo "|------|------|---------|"
@@ -1328,24 +1237,21 @@ PYEOF
 
         local p5_status="正常"
         for ph in phase4; do
-            local lf="${LOG_DIR}/${ph}/train.log"
+            local lf="${LOG_DIR}/${ph}/${TRAIN_LOG_NAME}"
             if [[ -f "${lf}" ]] && grep -qi "sigsegv\|segmentation" "${lf}"; then
                 p5_status="⚠ 检测到崩溃"
                 break
             fi
         done
-        echo "| P5 | C++ 梯度索引 bug / NaN | ${p5_status} |"
-        echo "| P6 | Router 梯度稳定性 | 见 plots/04_grad_norm.png |"
+        echo "| P5 | SIGSEGV / NaN | ${p5_status} |"
         echo "| P7 | update_base_weights 开销 | 见 phase4_analysis.txt / step_timing |"
 
         echo ""
-        echo "## 7. 后续分析"
+        echo "## 7. 可视化输出"
         echo ""
-        echo '```bash'
-        echo "python3 ${ANALYZE_SCRIPT} --log-dir ${LOG_DIR}"
-        echo '```'
-        echo ""
-        echo "> 注: 若随后运行 analyze.py，将用更完整的中文报告覆盖本文件（仍只保留 summary.md）。"
+        echo "- GPU 显存: \`${LOG_DIR}/plots/01_gpu_memory.png\`"
+        echo "- CPU 内存: \`${LOG_DIR}/plots/02_cpu_ram.png\`"
+        echo "- TPS: \`${LOG_DIR}/plots/07_tps.png\`"
     } > "${summary}"
 
     log "Summary: ${summary}"
@@ -1357,54 +1263,238 @@ PYEOF
 # --------------------------------------------------------------------------- #
 cleanup() {
     stop_monitor
-    [[ -p "${MONITOR_FIFO}" ]] && rm -f "${MONITOR_FIFO}"
+    [[ -n "${MONITOR_FIFO}" && -p "${MONITOR_FIFO}" ]] && rm -f "${MONITOR_FIFO}"
+    return 0
 }
 
 trap cleanup EXIT INT TERM
 
 # --------------------------------------------------------------------------- #
+# Run one method from setup through reporting.  This function returns only
+# after all child processes for the method have stopped, which guarantees that
+# Full and LoRA never execute concurrently.
+# --------------------------------------------------------------------------- #
+run_finetune_task() {
+    local requested_mode="$1"
+    local task_exit=0
+    setup_task_dir "${requested_mode}"
+
+    phase_banner "START ${FT_DISPLAY_NAME} (sequential task)"
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        generate_memory_component_estimate
+        start_monitor
+    fi
+
+    run_phase4 || task_exit=$?
+
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        stop_monitor
+        generate_memory_component_timeline
+
+        if [[ -f "${ANALYZE_SCRIPT}" ]]; then
+            log "Running visualization analysis for ${FT_MODE}..."
+            "${PYTHON}" "${ANALYZE_SCRIPT}" --log-dir "${LOG_DIR}" \
+                >> "${LOG_DIR}/analyze.log" 2>&1 && \
+                ok "Charts generated: ${LOG_DIR}/plots/" || \
+                warn "analyze.py failed, run manually: python3 ${ANALYZE_SCRIPT} --log-dir ${LOG_DIR}"
+        fi
+
+        # analyze.py also writes summary.md; write our mode-aware summary last.
+        generate_summary
+    fi
+
+    if [[ "${task_exit}" -eq 0 ]]; then
+        ok "${FT_DISPLAY_NAME} completed — ${LOG_DIR}"
+    else
+        warn "${FT_DISPLAY_NAME} failed (${task_exit}) — ${LOG_DIR}"
+    fi
+    return "${task_exit}"
+}
+
+generate_session_config() {
+    "${PYTHON}" - \
+        "${SESSION_DIR}" "${FINETUNE_SELECTION}" "${NUM_GPUS}" \
+        "${TRAIN_BATCH_SIZE}" "${GRAD_ACCUM_STEPS}" "${CUTOFF_LEN}" \
+        "${PHASE4_STEPS}" "${WARMUP_SKIP}" "${LEARNING_RATE}" \
+        "${LORA_RANK}" "${LORA_ALPHA}" "$(basename "${ACCEL_CONFIG}")" <<'PYEOF'
+import json
+import sys
+from pathlib import Path
+
+out = Path(sys.argv[1]) / "session_config.json"
+obj = {
+    "selection": sys.argv[2],
+    "execution_order": ["full", "lora"] if sys.argv[2] == "both" else [sys.argv[2]],
+    "shared_training_parameters": {
+        "num_gpus": int(sys.argv[3]),
+        "per_device_train_batch_size": int(sys.argv[4]),
+        "gradient_accumulation_steps": int(sys.argv[5]),
+        "cutoff_len": int(sys.argv[6]),
+        "max_steps": int(sys.argv[7]),
+        "warmup_skip": int(sys.argv[8]),
+        "stable_step_interval": [int(sys.argv[8]) + 1, int(sys.argv[7])],
+        "learning_rate": sys.argv[9],
+        "accelerate_config": sys.argv[12],
+    },
+    "lora_only_parameters": {
+        "lora_rank": int(sys.argv[10]),
+        "lora_alpha": int(sys.argv[11]),
+        "lora_target": "all",
+    },
+}
+out.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n")
+print(f"Session config: {out}")
+PYEOF
+}
+
+generate_session_summary() {
+    "${PYTHON}" - "${SESSION_DIR}" "${FINETUNE_SELECTION}" <<'PYEOF'
+import json
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+selection = sys.argv[2]
+modes = ["full", "lora"] if selection == "both" else [selection]
+tags = {"full": "full_ft", "lora": "lora_ft"}
+log_names = {"full": "train_full_ft.log", "lora": "train_lora_ft.log"}
+common_keys = (
+    "per_device_train_batch_size",
+    "gradient_accumulation_steps",
+    "learning_rate",
+    "max_steps",
+    "cutoff_len",
+)
+
+def simple_yaml(path):
+    values = {}
+    if not path.exists():
+        return values
+    for line in path.read_text(errors="replace").splitlines():
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*):\s*(.*?)\s*(?:#.*)?$", line)
+        if m:
+            values[m.group(1)] = m.group(2).strip("'\"")
+    return values
+
+rows = []
+configs = {}
+for mode in modes:
+    task = root / tags[mode]
+    cfg = simple_yaml(task / "phase4" / "train_config.yaml")
+    configs[mode] = cfg
+    timing_path = task / "phase4" / "step_timing" / "step_timing.json"
+    flops_path = task / "phase4" / "step_timing" / "flops_analysis.json"
+    timing = json.loads(timing_path.read_text()) if timing_path.exists() else {}
+    flops = json.loads(flops_path.read_text()) if flops_path.exists() else {}
+    stable = timing.get("aggregate_stable") or {}
+    sanity = flops.get("observed_phase_sanity") or {}
+    rows.append({
+        "mode": mode,
+        "exit": (task / "phase4" / "exit_code.txt").read_text().strip()
+            if (task / "phase4" / "exit_code.txt").exists() else "-",
+        "stable_steps": timing.get("num_stable_steps", "-"),
+        "tps": (timing.get("tps_attribution") or {}).get("stable_tps"),
+        "forward": (stable.get("forward_sec") or {}).get("mean_sec"),
+        "backward": (stable.get("backward_sec") or {}).get("mean_sec"),
+        "optimizer": (stable.get("optimizer_sec") or {}).get("mean_sec"),
+        "judgements": "/".join(
+            (sanity.get(p) or {}).get("status_cn", "-")
+            for p in ("forward", "backward", "optimizer")
+        ),
+        "train_log": task / "phase4" / log_names[mode],
+    })
+
+consistent = True
+mismatches = []
+if len(modes) == 2:
+    for key in common_keys:
+        left, right = configs["full"].get(key), configs["lora"].get(key)
+        if left != right:
+            consistent = False
+            mismatches.append(f"{key}: full={left!r}, lora={right!r}")
+
+def fmt(value, digits=4):
+    return "-" if value is None else f"{value:.{digits}f}"
+
+session_cfg = json.loads((root / "session_config.json").read_text())
+shared = session_cfg["shared_training_parameters"]
+lines = [
+    "# Qwen3-30B-A3B 微调性能测试会话",
+    "",
+    f"- 选择: **{selection}**",
+    f"- 串行顺序: `{' -> '.join(session_cfg['execution_order'])}`",
+    f"- 公共参数一致性: **{'通过' if consistent else '失败'}**",
+    f"- GPU/batch/GAS: {shared['num_gpus']} / {shared['per_device_train_batch_size']} / {shared['gradient_accumulation_steps']}",
+    f"- steps/warmup/稳定区间: {shared['max_steps']} / {shared['warmup_skip']} / {shared['stable_step_interval'][0]}-{shared['stable_step_interval'][1]}",
+    f"- learning_rate: {shared['learning_rate']}",
+    "",
+]
+if mismatches:
+    lines += ["## 参数不一致", ""] + [f"- {x}" for x in mismatches] + [""]
+lines += [
+    "## 稳定区间对比",
+    "",
+    "| 方式 | 退出码 | 稳定 steps | TPS | forward 均值(s) | backward 均值(s) | optimizer 均值(s) | FLOPs 判断(fwd/bwd/opt) |",
+    "|------|-------:|-------------:|----:|----------------:|-----------------:|------------------:|-------------------------|",
+]
+for row in rows:
+    lines.append(
+        f"| {row['mode']} | {row['exit']} | {row['stable_steps']} | {fmt(row['tps'], 2)} | "
+        f"{fmt(row['forward'])} | {fmt(row['backward'])} | {fmt(row['optimizer'])} | {row['judgements']} |"
+    )
+lines += ["", "## 训练日志", ""]
+for row in rows:
+    lines.append(f"- {row['mode']}: `{row['train_log']}`")
+lines += [
+    "",
+    "> FLOPs 判断是基于可配置理论峰值的 roofline sanity check；低利用率表示需要定位热点，不等同于单独证明实现错误。",
+    "",
+]
+(root / "comparison.md").write_text("\n".join(lines))
+print("\n".join(lines))
+PYEOF
+}
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 main() {
+    local selection_display="${FINETUNE_SELECTION}"
+    [[ "${FINETUNE_SELECTION}" == "both" ]] && selection_display="both (full -> lora)"
     echo ""
-    echo -e "${BOLD}Qwen3-30B-A3B KTransformers REAL Full Fine-Tuning Test Suite (AMXBF16)${NC}"
+    echo -e "${BOLD}Qwen3-30B-A3B KTransformers Fine-Tuning Performance Test (AMXBF16)${NC}"
     echo -e "Time: $(run_time_display)"
-    echo -e "Run label: ${RUN_LABEL}"
-    echo -e "KT train mode: ${ACCELERATE_KT_TRAIN_MODE}  (full-weight expert grads)"
+    echo -e "Selection/order: ${selection_display}"
     echo -e "Dataset: ${DATASET_NAME} @ ${DATA_DIR}  (every sample >7000 tokens)"
-    echo -e "GPUs: ${NUM_GPUS}  |  cutoff_len: ${CUTOFF_LEN}  |  GAS: ${GRAD_ACCUM_STEPS}  |  warmup_skip: ${WARMUP_SKIP}"
+    echo -e "GPUs: ${NUM_GPUS}  |  batch: ${TRAIN_BATCH_SIZE}  |  cutoff_len: ${CUTOFF_LEN}  |  GAS: ${GRAD_ACCUM_STEPS}"
+    echo -e "Steps: ${PHASE4_STEPS}  |  stable interval: $((WARMUP_SKIP + 1))-${PHASE4_STEPS}"
     echo ""
 
     check_env
     estimate_resources
-    setup_run_dir
-    generate_memory_component_estimate
-    start_monitor
+    setup_session_dir
+    generate_session_config
 
     local overall_exit=0
+    case "${FINETUNE_SELECTION}" in
+        both)
+            run_finetune_task full || overall_exit=1
+            run_finetune_task lora || overall_exit=1
+            ;;
+        full|lora)
+            run_finetune_task "${FINETUNE_SELECTION}" || overall_exit=1
+            ;;
+    esac
 
-    run_phase4 || overall_exit=1
-
-    stop_monitor
-
-    generate_memory_component_timeline
-    generate_summary
-
-    if [[ -f "${ANALYZE_SCRIPT}" ]]; then
-        log "Running visualization analysis..."
-        "${PYTHON}" "${ANALYZE_SCRIPT}" --log-dir "${LOG_DIR}" \
-            >> "${LOG_DIR}/analyze.log" 2>&1 && \
-            ok "Charts generated: ${LOG_DIR}/plots/" || \
-            warn "analyze.py failed, run manually: python3 ${ANALYZE_SCRIPT} --log-dir ${LOG_DIR}"
-    fi
+    generate_session_summary
 
     echo ""
     if [[ "${overall_exit}" -eq 0 ]]; then
-        ok "All phases completed — log directory: ${LOG_DIR}"
+        ok "Selected fine-tuning task(s) completed — ${SESSION_DIR}"
     else
-        warn "Some phases had issues — check: ${LOG_DIR}/summary.md"
+        warn "One or more tasks failed — see ${SESSION_DIR}/comparison.md"
     fi
-
     return "${overall_exit}"
 }
 
