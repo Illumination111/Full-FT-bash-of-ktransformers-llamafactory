@@ -13,12 +13,16 @@ trust_remote_code: true
 stage: sft
 do_train: true
 finetuning_type: full
+# Keep the Full-FT default pure. LLaMA-Factory defaults lora_rank to 8 and the
+# KT plugin forwards that value even in full mode; the runner overrides this to
+# 8 explicitly for the LoRA task.
+lora_rank: 0
 
 ### dataset
 dataset: fft_real_100
 dataset_dir: /mnt/data2/wbw/FFTtest/dataset
 template: qwen3
-cutoff_len: 1024
+cutoff_len: 4096
 max_samples: 100
 overwrite_cache: true
 preprocessing_num_workers: 8

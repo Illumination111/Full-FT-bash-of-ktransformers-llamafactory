@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Compare stable step timings with a theoretical Qwen3-MoE FLOPs model.
 
-The report is a roofline-style sanity check, not a hardware benchmark.  The
-model deliberately separates routed-expert CPU work from non-expert GPU work
-and uses configurable peak throughput/bandwidth values.
+The report is a roofline-style sanity check, not a hardware benchmark.  It
+supports both the KTransformers split CPU/GPU execution path and native GPU
+execution with a DeepSpeed CPU-offloaded optimizer.
 """
 
 from __future__ import annotations
@@ -80,6 +80,7 @@ def build_flops_analysis(
     cpu_bf16_tflops: float,
     gpu_memory_gbps: float,
     cpu_memory_gbps: float,
+    backend: str = "kt",
 ) -> dict[str, Any]:
     stable = timing.get("aggregate_stable") or {}
     if not stable:
@@ -160,8 +161,14 @@ def build_flops_analysis(
         cpu_lora_forward = 2.0 * tokens_per_step * lora_rank * active_cpu_lora_dims
         gpu_lora_forward = 2.0 * tokens_per_step * lora_rank * active_gpu_lora_dims
 
-    forward_cpu = cpu_base_forward + cpu_lora_forward
-    forward_gpu = gpu_linear_forward + gpu_attention_forward + gpu_lora_forward
+    if backend == "deepspeed":
+        # ZeRO-3 Offload stores parameter/optimizer partitions on CPU, but all
+        # model matmuls still execute on GPU after parameters are prefetched.
+        forward_cpu = 0.0
+        forward_gpu = cpu_base_forward + cpu_lora_forward + gpu_linear_forward + gpu_attention_forward + gpu_lora_forward
+    else:
+        forward_cpu = cpu_base_forward + cpu_lora_forward
+        forward_gpu = gpu_linear_forward + gpu_attention_forward + gpu_lora_forward
 
     if mode == "full":
         # For trainable matmuls, dX and dW together are approximately 2x the
@@ -177,6 +184,12 @@ def build_flops_analysis(
         backward_gpu = gpu_linear_forward + 2.0 * gpu_attention_forward + 2.0 * gpu_lora_forward
         optimizer_cpu_params = cpu_lora_params
         optimizer_gpu_params = gpu_lora_params
+
+    if backend == "deepspeed":
+        backward_gpu += backward_cpu
+        backward_cpu = 0.0
+        optimizer_cpu_params += optimizer_gpu_params
+        optimizer_gpu_params = 0
 
     # AdamW arithmetic is approximately 14 scalar FLOPs/parameter.  Its time
     # is normally memory-bound, so the roofline also includes 32 B/parameter.
@@ -235,6 +248,7 @@ def build_flops_analysis(
     return {
         "status": "OK",
         "mode": mode,
+        "backend": backend,
         "measurement": {
             "warmup_skip": int(timing.get("warmup_skip", 0)),
             "stable_steps": int(timing.get("num_stable_steps", 0)),
@@ -266,7 +280,12 @@ def build_flops_analysis(
             "只读取 aggregate_stable，因此所有均值都已排除 warmup steps。",
             "理论峰值是乐观 roofline；低利用率可定位热点，但不能单独证明实现存在错误。",
             "判断阈值：下界利用率 >=10% 为正常，1%–10% 为偏低，<1% 为异常偏慢。",
-            "CPU expert 与 GPU non-expert 的下界取 max，允许二者理想重叠。",
+            (
+                "DeepSpeed: 全部模型计算在 GPU 执行，CPU 承担 ZeRO 参数驻留/传输和 CPUAdam；"
+                "本报告的 optimizer roofline 按 CPU offload 计算。"
+                if backend == "deepspeed"
+                else "KTransformers: CPU expert 与 GPU non-expert 的下界取 max，允许二者理想重叠。"
+            ),
             "optimizer 同时使用 AdamW FLOPs 与每参数 32 字节访存近似；小规模 LoRA optimizer 另考虑固定开销。",
             "FLOPs 未计 embedding lookup、norm、激活函数、softmax、routing sort、通信和主机/设备拷贝。",
         ],
@@ -283,6 +302,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     hardware = report["hardware_assumptions"]
     lines += [
         f"- 微调方式: **{report['mode']}**",
+        f"- 后端口径: **{report.get('backend', 'kt')}**",
         f"- 稳定区间: 去除前 {measurement['warmup_skip']} steps，统计 {measurement['stable_steps']} steps",
         f"- 每 optimizer step: {measurement['tokens_per_optimizer_step']} tokens "
         f"({measurement['num_gpus']} GPU × batch {measurement['per_device_batch_size']} × "
@@ -318,6 +338,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timing-json", required=True, type=Path)
     parser.add_argument("--model-config", required=True, type=Path)
     parser.add_argument("--mode", required=True, choices=("full", "lora"))
+    parser.add_argument("--backend", choices=("kt", "deepspeed"), default="kt")
     parser.add_argument("--seq-len", required=True, type=int)
     parser.add_argument("--batch-size", required=True, type=int)
     parser.add_argument("--gas", required=True, type=int)
@@ -356,6 +377,7 @@ def main() -> int:
             cpu_bf16_tflops=args.cpu_bf16_tflops,
             gpu_memory_gbps=args.gpu_memory_gbps,
             cpu_memory_gbps=args.cpu_memory_gbps,
+            backend=args.backend,
         )
 
     json_path = args.output_dir / "flops_analysis.json"

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Qwen3-30B-A3B KTransformers Fine-Tuning Performance Test (Full / LoRA)
+# Qwen3-30B-A3B LLaMA-Factory + DeepSpeed ZeRO-3 Offload Performance Test
+# (Full / LoRA, BF16)
 #
 # Full and LoRA runs use the same dataset, batch size, GAS, GPU topology,
 # learning rate, max steps and post-warmup TPS interval.  Only the fine-tuning
@@ -8,7 +9,7 @@
 # full-weight run always completes before the LoRA run starts.
 #
 # Usage:
-#   bash run_finetune_perf_test_bf16.sh [--mode both|full|lora]
+#   bash run_finetune_perf_test_bf16_deepspeed.sh [--mode both|full|lora]
 #        [--gpus 1] [--batch-size 1] [--gas 1]
 #        [--steps 15] [--warmup-steps 5] [--dry-run]
 #
@@ -47,13 +48,13 @@ ANALYZE_SCRIPT="${SCRIPT_DIR}/analyze.py"
 FLOPS_ANALYZE_SCRIPT="${SCRIPT_DIR}/flops_timing_analysis.py"
 
 LLAMA_FACTORY_DIR="/mnt/data2/wbw/LLaMA-Factory"
-MODEL_PATH="/mnt/data3/models/Qwen3-30B-A3B"    # Original HF BF16 weights (AMXBF16 reads directly)
+MODEL_PATH="/mnt/data3/models/Qwen3-30B-A3B"    # Original HF BF16 weights
 
-# The selected accelerate config is shared by both fine-tuning methods.
-ACCEL_CONFIG_1GPU="${CONFIGS_DIR}/accelerate_fft_amxbf16_1gpu.yaml"
-ACCEL_CONFIG_2GPU="${CONFIGS_DIR}/accelerate_fft_amxbf16_2gpu.yaml"
-ACCEL_CONFIG_4GPU="${CONFIGS_DIR}/accelerate_fft_amxbf16_4gpu.yaml"
-ACCEL_CONFIG="${ACCEL_CONFIG_1GPU}"
+# DeepSpeed is configured through Hugging Face TrainingArguments.  ZeRO-3 is
+# required here (instead of classic ZeRO-2 Offload), because the BF16 weights
+# alone do not fit on one or two 24 GB cards.  Both parameters and optimizer
+# states are offloaded to CPU so the 1/2/4-GPU matrix matches the KT benchmark.
+DEEPSPEED_CONFIG="${CONFIGS_DIR}/deepspeed_zero3_offload_bf16.json"
 
 TRAIN_CONFIG_BASE="${CONFIGS_DIR}/train_finetune_perf_qwen3_30b.yaml"
 
@@ -71,7 +72,7 @@ LORA_RANK=8
 LORA_ALPHA=16
 
 # Roofline assumptions.  Defaults match RTX 4090 BF16 Tensor Core peak and the
-# 2x48-core Xeon 8488C AMX / 16-channel DDR5 host used by this test.
+# 2x48-core Xeon 8488C / 16-channel DDR5 host used by this test.
 GPU_BF16_TFLOPS="${GPU_BF16_TFLOPS:-82.58}"
 CPU_BF16_TFLOPS="${CPU_BF16_TFLOPS:-373.56}"
 GPU_MEMORY_GBPS="${GPU_MEMORY_GBPS:-1008.0}"
@@ -80,8 +81,9 @@ CPU_MEMORY_GBPS="${CPU_MEMORY_GBPS:-614.4}"
 MONITOR_FIFO=""
 MONITOR_PID=""
 
-# Conda environment
-CONDA_ENV="${FFT_CONDA_ENV:-Kllama}"
+# Conda environment.  Keep it separate from Kllama so the comparison changes
+# only the backend and cannot accidentally import KTransformers patches.
+CONDA_ENV="${FFT_CONDA_ENV:-Deepspeed}"
 
 _find_conda_python() {
     local env="$1"
@@ -105,7 +107,7 @@ CONDA_BIN_DIR="$(dirname "${PYTHON}")"
 NUM_GPUS=1                                                      # Single-card by default
 DRY_RUN=0
 FINETUNE_SELECTION="both"
-BACKEND_LABEL="AMX_BF16"
+BACKEND_LABEL="DEEPSPEED_Z3_OFFLOAD_BF16"
 TIMING_MODULE_DIR="${SCRIPT_DIR}"
 TRAIN_ENTRY_MODULE="finetune_train_with_timing"
 SESSION_DIR=""
@@ -117,7 +119,7 @@ FT_DISPLAY_NAME=""
 
 usage() {
     cat <<'EOF'
-Usage: bash run_finetune_perf_test_bf16.sh [options]
+Usage: bash run_finetune_perf_test_bf16_deepspeed.sh [options]
 
 Fine-tuning selection:
   --mode both|full|lora       Run both (full first), full only, or LoRA only (default: both)
@@ -136,7 +138,7 @@ LoRA parameters:
 
 Roofline assumptions:
   --gpu-bf16-tflops VALUE     Peak BF16 TFLOPS per GPU (default: 82.58)
-  --cpu-bf16-tflops VALUE     Total host AMX BF16 TFLOPS (default: 373.56)
+  --cpu-bf16-tflops VALUE     Total host BF16 TFLOPS assumption (default: 373.56)
   --gpu-memory-gbps VALUE     Memory bandwidth per GPU (default: 1008.0)
   --cpu-memory-gbps VALUE     Total host memory bandwidth (default: 614.4)
 
@@ -200,14 +202,8 @@ if ! [[ "${WARMUP_SKIP}" =~ ^[0-9]+$ ]] || [[ "${WARMUP_SKIP}" -ge "${PHASE4_STE
     echo "Invalid --warmup-steps: ${WARMUP_SKIP} (must be >= 0 and < --steps ${PHASE4_STEPS})" >&2
     exit 1
 fi
-if [[ "${NUM_GPUS}" -eq 1 ]]; then
-    ACCEL_CONFIG="${ACCEL_CONFIG_1GPU}"
-elif [[ "${NUM_GPUS}" -eq 2 ]]; then
-    ACCEL_CONFIG="${ACCEL_CONFIG_2GPU}"
-elif [[ "${NUM_GPUS}" -eq 4 ]]; then
-    ACCEL_CONFIG="${ACCEL_CONFIG_4GPU}"
-else
-    echo "Unsupported --gpus ${NUM_GPUS}: matching configs exist only for 1, 2 and 4 GPUs" >&2
+if [[ "${NUM_GPUS}" -ne 1 && "${NUM_GPUS}" -ne 2 && "${NUM_GPUS}" -ne 4 ]]; then
+    echo "Unsupported --gpus ${NUM_GPUS}: the comparison matrix supports only 1, 2 and 4 GPUs" >&2
     exit 1
 fi
 for item in \
@@ -251,7 +247,7 @@ check_env() {
 
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         warn "Dry-run: GPU driver, model, dataset and Python package checks are skipped"
-        for cfg_file in "${TRAIN_CONFIG_BASE}" "${ACCEL_CONFIG}" "${FLOPS_ANALYZE_SCRIPT}"; do
+        for cfg_file in "${TRAIN_CONFIG_BASE}" "${DEEPSPEED_CONFIG}" "${FLOPS_ANALYZE_SCRIPT}"; do
             [[ -e "${cfg_file}" ]] || { error "Required file not found: ${cfg_file}"; exit 1; }
         done
         ok "Static environment check passed"
@@ -271,12 +267,12 @@ check_env() {
         exit 1
     fi
 
-    # Model path (AMXBF16 reads original HF BF16 weights directly)
+    # Model path (native HF BF16 weights, loaded and partitioned by ZeRO-3)
     if [[ ! -d "${MODEL_PATH}" ]]; then
         error "Model path not found: ${MODEL_PATH}"
         exit 1
     fi
-    ok "Model path (AMXBF16): ${MODEL_PATH}"
+    ok "Model path (HF BF16): ${MODEL_PATH}"
 
     if [[ ! -d "${LLAMA_FACTORY_DIR}" ]]; then
         error "LLaMA-Factory directory not found: ${LLAMA_FACTORY_DIR}"
@@ -296,24 +292,64 @@ check_env() {
     ok "Dataset: ${DATA_DIR}/${DATASET_NAME}.json"
 
     # Config files (must exist before any phase starts)
-    for cfg_file in "${TRAIN_CONFIG_BASE}" "${ACCEL_CONFIG}"; do
+    for cfg_file in "${TRAIN_CONFIG_BASE}" "${DEEPSPEED_CONFIG}"; do
         if [[ ! -f "${cfg_file}" ]]; then
             error "Required config not found: ${cfg_file}"
             exit 1
         fi
     done
     ok "Training config: ${TRAIN_CONFIG_BASE}"
-    ok "Accelerate config: ${ACCEL_CONFIG}"
+    ok "DeepSpeed config: ${DEEPSPEED_CONFIG}"
 
     log "Python executable: ${PYTHON}"
     log "Conda env: ${CONDA_ENV}"
-    log "GPU count: ${NUM_GPUS} (accelerate config: $(basename ${ACCEL_CONFIG}))"
+    log "GPU count: ${NUM_GPUS} (torchrun + $(basename "${DEEPSPEED_CONFIG}"))"
+
+    if [[ "${PYTHON}" != *"/envs/${CONDA_ENV}/bin/python3" ]]; then
+        error "Conda environment '${CONDA_ENV}' was not found; expected .../envs/${CONDA_ENV}/bin/python3"
+        error "Create it with Conda, use upstream Accelerate/Transformers, then pip-install DeepSpeed with DS_BUILD_CPU_ADAM=1."
+        exit 1
+    fi
+
+    if "${PYTHON}" -c '
+from importlib.metadata import PackageNotFoundError, version
+for name in ("ktransformers", "kt-kernel", "accelerate-kt", "transformers-kt"):
+    try:
+        version(name)
+    except PackageNotFoundError:
+        continue
+    raise SystemExit(0)
+raise SystemExit(1)
+'; then
+        error "${CONDA_ENV} contains KTransformers fork packages; this is not a native LLaMA-Factory baseline."
+        error "Remove ktransformers, kt-kernel, accelerate-kt and transformers-kt, then reinstall upstream accelerate/transformers."
+        exit 1
+    fi
+    ok "Native LLaMA-Factory dependency set (no KTransformers fork packages)"
 
     if ! "${PYTHON}" -c "import accelerate" &>/dev/null; then
         error "accelerate not installed in ${PYTHON}"
         exit 1
     fi
     ok "accelerate $(${PYTHON} -c 'import accelerate; print(accelerate.__version__)')"
+
+    if ! "${PYTHON}" -c "import deepspeed" &>/dev/null; then
+        error "deepspeed is not installed in Conda environment ${CONDA_ENV}"
+        exit 1
+    fi
+    ok "deepspeed $(${PYTHON} -c 'import deepspeed; print(deepspeed.__version__)')"
+
+    # A source-only PyPI install would JIT-compile CPUAdam during the measured
+    # run.  Require the extension to be embedded in the installed package so
+    # startup/first-step numbers are comparable and reproducible.
+    if ! "${PYTHON}" -c \
+        "import importlib.util; from deepspeed.git_version_info import installed_ops; assert installed_ops.get('cpu_adam') and importlib.util.find_spec('deepspeed.ops.adam.cpu_adam_op')" \
+        &>/dev/null; then
+        error "DeepSpeed CPUAdam op is not pre-installed in ${CONDA_ENV}."
+        error "Reinstall with CUDA_HOME=/usr/local/cuda-12.8 DS_BUILD_CPU_ADAM=1 pip install --no-build-isolation --force-reinstall --no-deps deepspeed."
+        exit 1
+    fi
+    ok "DeepSpeed CPUAdam op is pre-installed (no benchmark-time JIT)"
 
     for pkg in psutil pynvml matplotlib pandas; do
         if "${PYTHON}" -c "import ${pkg}" &>/dev/null; then
@@ -330,19 +366,21 @@ check_env() {
 # Resource estimation
 # --------------------------------------------------------------------------- #
 estimate_resources() {
-    phase_banner "Shared Test Parameters (Qwen3-30B-A3B, AMXBF16)"
+    phase_banner "Shared Test Parameters (Qwen3-30B-A3B, DeepSpeed ZeRO-3 Offload)"
 
     echo -e "${BOLD}== Model Architecture ==${NC}"
     echo "  Architecture : Qwen3MoeForCausalLM  (pure text MoE)"
     echo "  Layers       : 48   |  Experts/layer: 128  |  Active experts/token: 8"
-    echo "  Quantization : AMXBF16 (native BF16, no quantization)"
-    echo "  CPU layout   : 2 NUMA nodes, kt_tp_enabled=true (48 threads each)"
+    echo "  Precision    : native BF16 (no quantization)"
+    echo "  Distribution : DeepSpeed ZeRO-3"
+    echo "  CPU offload  : parameters + optimizer (pinned memory)"
+    echo "  CPU optimizer: pre-installed DeepSpeedCPUAdam"
     echo "  Weight source: ${MODEL_PATH}"
     echo ""
 
     echo -e "${BOLD}== Fair-comparison configuration ==${NC}"
     echo "  Selection: ${FINETUNE_SELECTION} (both executes full -> lora)"
-    echo "  Accelerate config: $(basename "${ACCEL_CONFIG}")"
+    echo "  DeepSpeed config: $(basename "${DEEPSPEED_CONFIG}")"
     echo "  Per-device batch: ${TRAIN_BATCH_SIZE}"
     echo "  Dataset: 100 samples, all truncated to exactly ${CUTOFF_LEN} tokens"
     echo "  GAS (gradient_accumulation_steps): ${GRAD_ACCUM_STEPS}"
@@ -472,6 +510,16 @@ make_phase_config() {
     # Sync overwrite_output_dir path too
     sed -i "s|overwrite_output_dir: .*|overwrite_output_dir: true|g" "${cfg}"
 
+    # The shared base belongs to the KT benchmark.  Explicitly disable KT and
+    # attach the native LLaMA-Factory/HF Trainer DeepSpeed configuration.
+    sed -i "s|^use_kt: .*|use_kt: false|g" "${cfg}"
+    sed -i "s|^kt_weight_path: .*|kt_weight_path: null|g" "${cfg}"
+    if grep -q '^deepspeed:' "${cfg}"; then
+        sed -i "s|^deepspeed: .*|deepspeed: ${DEEPSPEED_CONFIG}|g" "${cfg}"
+    else
+        echo "deepspeed: ${DEEPSPEED_CONFIG}" >> "${cfg}"
+    fi
+
     while [[ $# -gt 0 ]]; do
         local kv="$1"; shift
         local key="${kv%%=*}"
@@ -487,7 +535,7 @@ make_phase_config() {
 }
 
 # --------------------------------------------------------------------------- #
-# Run a single accelerate training command.  There is deliberately no
+# Run one native LLaMA-Factory + DeepSpeed training command.  There is no
 # mode-dependent OOM fallback: changing GPU count for only one method would
 # invalidate a Full-vs-LoRA throughput comparison.
 # --------------------------------------------------------------------------- #
@@ -499,7 +547,7 @@ run_train() {
     local exit_code=0
 
     log "Starting training [${phase_name}]: ${desc}"
-    log "  accelerate config : $(basename ${ACCEL_CONFIG})"
+    log "  DeepSpeed config  : $(basename "${DEEPSPEED_CONFIG}")"
     log "  GPUs              : ${NUM_GPUS}"
     send_event "phase:${phase_name}"
     send_event "event:train_start"
@@ -507,24 +555,26 @@ run_train() {
     local gpus_str
     gpus_str=$(seq 0 $((NUM_GPUS - 1)) | paste -sd ',')
 
-    local accelerate_bin="${CONDA_BIN_DIR}/accelerate"
-    [[ ! -x "${accelerate_bin}" ]] && accelerate_bin="accelerate"
+    local torchrun_bin="${CONDA_BIN_DIR}/torchrun"
+    [[ ! -x "${torchrun_bin}" ]] && torchrun_bin="torchrun"
 
     local timing_dir="${LOG_DIR}/${phase_name}/step_timing"
     local cmd=(
         env
-        USE_KT=1
-        ACCELERATE_USE_KT=true
-        ACCELERATE_KT_TRAIN_MODE="${FT_MODE}"
-        KT_FINETUNE_MODE="${FT_MODE}"
+        USE_KT=0
+        ACCELERATE_USE_KT=false
+        CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.8}"
+        FFT_TRAINING_BACKEND=deepspeed
         KT_STEP_TIMING=1
+        KT_FINETUNE_MODE="${FT_MODE}"
         KT_STEP_TIMING_OUT_DIR="${timing_dir}"
         KT_STEP_TIMING_WARMUP_SKIP="${WARMUP_SKIP}"
         KT_STEP_TIMING_TOKENS_PER_STEP="$((NUM_GPUS * TRAIN_BATCH_SIZE * CUTOFF_LEN * GRAD_ACCUM_STEPS))"
         PYTHONPATH="${TIMING_MODULE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
         CUDA_VISIBLE_DEVICES="${gpus_str}"
-        "${accelerate_bin}" launch
-        --config_file "${ACCEL_CONFIG}"
+        "${torchrun_bin}"
+        --standalone
+        --nproc_per_node="${NUM_GPUS}"
         -m "${TRAIN_ENTRY_MODULE}" train
         "${train_cfg}"
     )
@@ -573,15 +623,15 @@ analyze_log() {
         echo "NaN lines: ${nan_count};  Inf lines: ${inf_count}"
 
         echo ""
-        echo "--- KT-related warnings/errors ---"
-        grep -i "ktransformer\|kt_kernel\|amx\|moe\|expert\|backward\|grad_proj" \
+        echo "--- DeepSpeed/ZeRO-related warnings/errors ---"
+        grep -i "deepspeed\|zero\|cpuadam\|offload\|moe\|expert\|backward" \
              "${log_file}" 2>/dev/null | grep -i "warn\|error\|fail\|bug" | tail -20 \
-             || echo "(no KT-related alerts)"
+             || echo "(no DeepSpeed/ZeRO-related alerts)"
 
         echo ""
-        echo "--- update_base_weights timing (P7: re-quantize overhead) ---"
-        grep -i "update_base_weights\|re-quantize\|set_base_weight\|TP_MOE_SFT" "${log_file}" | tail -20 \
-             || echo "(no update_base_weights log detected)"
+        echo "--- ZeRO-3 / CPUAdam activation evidence ---"
+        grep -i "ZeRO.*stage 3\|offload_param\|offload_optimizer\|DeepSpeedCPUAdam\|cpu_adam" "${log_file}" | tail -30 \
+             || echo "(no ZeRO-3/CPUAdam activation lines detected)"
 
         echo ""
         echo "--- Process exit code analysis ---"
@@ -592,7 +642,7 @@ analyze_log() {
             echo "⚠ CUDA OOM detected"
         fi
         if grep -qi "ddp_timeout\|timeout expired" "${log_file}"; then
-            echo "⚠ DDP timeout detected (P2/P7: CPU computation too slow)"
+            echo "⚠ Distributed timeout detected (host offload or communication may be too slow)"
         fi
     } | tee "${result_file}"
 }
@@ -625,18 +675,7 @@ lora_rank = int(sys.argv[7])
 def gb(n: float) -> float:
     return n / 1e9
 
-def gib_to_bytes(n: float) -> float:
-    return n * (1024 ** 3)
-
 cfg = json.loads((model_path / "config.json").read_text())
-cache_path = model_path / ".moe_analysis_cache.json"
-cache = {}
-if cache_path.exists():
-    try:
-        cache = json.loads(cache_path.read_text()).get("result", {})
-    except Exception:
-        cache = {}
-
 H = int(cfg["hidden_size"])
 shared_i = int(cfg.get("intermediate_size", 0) or 0)
 moe_i = int(cfg["moe_intermediate_size"])
@@ -644,52 +683,44 @@ E = int(cfg["num_experts"])
 L = int(cfg["num_hidden_layers"])
 top_k = int(cfg["num_experts_per_tok"])
 V = int(cfg["vocab_size"])
-
-expert_params = E * 3 * H * moe_i * L
-expert_weight_bytes = expert_params * 2
-if mode == "full":
-    expert_trainable_params = expert_params
+index_path = model_path / "model.safetensors.index.json"
+if index_path.exists():
+    total_weight_bytes = int(json.loads(index_path.read_text())["metadata"]["total_size"])
+    weight_size_source = "model.safetensors.index.json: metadata.total_size"
 else:
-    # gate/up: H->moe_i; down: moe_i->H, for all expert adapters.
-    expert_trainable_params = L * E * lora_rank * (4 * H + 2 * moe_i)
-expert_grad_bytes = expert_trainable_params * 4
-expert_adam_bytes = expert_trainable_params * 8
-
-rest_gib = float(cache.get("rest_size_gb", 0.0) or 0.0)
-if rest_gib > 0:
-    non_expert_weight_bytes = gib_to_bytes(rest_gib)
-    non_expert_source = ".moe_analysis_cache.json: rest_size_gb"
-else:
-    # Conservative fallback: embeddings, lm_head, attention, router/norm.
+    # BF16 fallback from the Qwen3-MoE architecture.
     head_dim = int(cfg.get("head_dim", H // int(cfg["num_attention_heads"])))
     nh = int(cfg["num_attention_heads"])
     nkv = int(cfg["num_key_value_heads"])
-    q = H * (nh * head_dim)
-    k = H * (nkv * head_dim)
-    v = H * (nkv * head_dim)
-    o = (nh * head_dim) * H
-    p_embed = V * H
-    p_lm = 0 if cfg.get("tie_word_embeddings", False) else V * H
-    p_attn = L * (q + k + v + o)
-    p_router_norm = L * (H * E + 2 * H)
-    non_expert_weight_bytes = (p_embed + p_lm + p_attn + p_router_norm) * 2
-    non_expert_source = "config fallback"
+    attn = L * (H * nh * head_dim + 2 * H * nkv * head_dim + nh * head_dim * H)
+    experts = L * E * 3 * H * moe_i
+    shared = L * 3 * H * shared_i
+    embed = V * H * (1 if cfg.get("tie_word_embeddings", False) else 2)
+    router_norm = L * (H * E + 2 * H) + H
+    total_weight_bytes = 2 * (attn + experts + shared + embed + router_norm)
+    weight_size_source = "config architecture fallback"
 
-gpu_model_weights = gb(non_expert_weight_bytes / num_gpus)
-if mode == "full":
-    gpu_trainable_params = non_expert_weight_bytes / 2
-else:
-    head_dim = int(cfg.get("head_dim", H // int(cfg["num_attention_heads"])))
-    nh = int(cfg["num_attention_heads"])
-    nkv = int(cfg["num_key_value_heads"])
-    q_out = nh * head_dim
-    kv_out = nkv * head_dim
-    attn_dims = (H + q_out) + 2 * (H + kv_out) + (q_out + H)
-    shared_dims = 2 * (H + shared_i) + (shared_i + H)
-    router_dims = H + E
-    gpu_trainable_params = L * lora_rank * (attn_dims + shared_dims + router_dims)
-gpu_gradients = gb(gpu_trainable_params * 4 / num_gpus)
-gpu_optimizer = gb(gpu_trainable_params * 8 / num_gpus)
+total_params = total_weight_bytes // 2
+head_dim = int(cfg.get("head_dim", H // int(cfg["num_attention_heads"])))
+nh = int(cfg["num_attention_heads"])
+nkv = int(cfg["num_key_value_heads"])
+q_out = nh * head_dim
+kv_out = nkv * head_dim
+attn_lora_dims = (H + q_out) + 2 * (H + kv_out) + (q_out + H)
+shared_lora_dims = 3 * (H + shared_i)
+expert_lora_dims = 3 * (H + moe_i)
+router_lora_dims = H + E
+lora_params = lora_rank * L * (
+    attn_lora_dims + shared_lora_dims + router_lora_dims + E * expert_lora_dims
+)
+trainable_params = total_params if mode == "full" else lora_params
+
+# ZeRO-3 auto bucket values are derived from hidden_size.  max_live_parameters
+# is explicitly 1e9 in the JSON, so this is only a cache/bucket upper-bound,
+# not a claim about exact instantaneous allocator usage.
+gpu_model_weights = gb(min(total_params, 1_000_000_000) * 2)
+gpu_gradients = gb(H * H * 2)
+gpu_optimizer = 0.0
 # Rough activation/workspace estimate scaled from the observed 1024-token,
 # batch=1 baseline. GAS does not retain multiple microbatch activation sets.
 gpu_activations = 2.0 * (cutoff_len / 1024.0) * batch_size
@@ -699,7 +730,8 @@ estimate = {
         "Measured totals come from monitor.csv.",
         "Component columns are model-structure estimates; nvidia-smi/psutil do not expose optimizer-vs-gradient ownership.",
         "Optimizer estimates assume AdamW m+v FP32 states.",
-        "Gradient estimates assume FP32 gradients for trainable tensors.",
+        "ZeRO-3 GPU columns are live-cache/bucket upper-bound estimates, not persistent ownership.",
+        "CPU estimates assume BF16 params/gradients plus FP32 master weights and AdamW m/v states.",
     ],
     "model": {
         "path": str(model_path),
@@ -712,7 +744,9 @@ estimate = {
         "cutoff_len": cutoff_len,
         "per_device_batch_size": batch_size,
         "num_gpus": num_gpus,
-        "non_expert_source": non_expert_source,
+        "weight_size_source": weight_size_source,
+        "total_parameters": total_params,
+        "trainable_parameters": trainable_params,
     },
     "gpu_per_card_gb": {
         "model_weights": gpu_model_weights,
@@ -722,13 +756,14 @@ estimate = {
         "estimated_full_step_total": gpu_model_weights + gpu_gradients + gpu_optimizer + gpu_activations,
     },
     "cpu_host_gb": {
-        "expert_model_weights": gb(expert_weight_bytes),
-        "expert_gradients": gb(expert_grad_bytes),
-        "expert_optimizer_adamw_m_v": gb(expert_adam_bytes),
-        "numa_work_buffers_estimate_low": 10.0,
-        "numa_work_buffers_estimate_high": 30.0,
-        "estimated_full_step_total_low": gb(expert_weight_bytes + expert_grad_bytes + expert_adam_bytes) + 10.0,
-        "estimated_full_step_total_high": gb(expert_weight_bytes + expert_grad_bytes + expert_adam_bytes) + 30.0,
+        "model_param_partitions_bf16": gb(total_weight_bytes),
+        "gradient_partitions_bf16": gb(trainable_params * 2),
+        "fp32_master_parameters": gb(trainable_params * 4),
+        "optimizer_adamw_m_v": gb(trainable_params * 8),
+        "offload_buffers_estimate_low": 2.0,
+        "offload_buffers_estimate_high": 10.0,
+        "estimated_full_step_total_low": gb(total_weight_bytes + trainable_params * 14) + 2.0,
+        "estimated_full_step_total_high": gb(total_weight_bytes + trainable_params * 14) + 10.0,
     },
 }
 
@@ -823,11 +858,12 @@ out_fields = [
     "timestamp", "elapsed_sec", "phase", "event",
     "ram_used_gb", "ram_delta_from_start_gb",
     "ram_scope",
-    "cpu_expert_model_weights_est_gb",
-    "cpu_expert_gradients_est_gb",
-    "cpu_expert_optimizer_adamw_est_gb",
-    "cpu_numa_workspace_est_low_gb",
-    "cpu_numa_workspace_est_high_gb",
+    "cpu_model_param_partitions_bf16_est_gb",
+    "cpu_gradient_partitions_bf16_est_gb",
+    "cpu_fp32_master_parameters_est_gb",
+    "cpu_optimizer_adamw_m_v_est_gb",
+    "cpu_offload_buffers_est_low_gb",
+    "cpu_offload_buffers_est_high_gb",
     "cpu_other_or_not_yet_allocated_gb",
 ]
 for c in gpu_cols:
@@ -857,10 +893,11 @@ with timeline_path.open("w", newline="") as f_out:
         ram_used = measured_ram(row)
         ram_delta = max(ram_used - baseline_ram, 0.0)
         cpu_known_low = (
-            cpu_est["expert_model_weights"]
-            + cpu_est["expert_gradients"]
-            + cpu_est["expert_optimizer_adamw_m_v"]
-            + cpu_est["numa_work_buffers_estimate_low"]
+            cpu_est["model_param_partitions_bf16"]
+            + cpu_est["gradient_partitions_bf16"]
+            + cpu_est["fp32_master_parameters"]
+            + cpu_est["optimizer_adamw_m_v"]
+            + cpu_est["offload_buffers_estimate_low"]
         ) if in_phase4 else 0.0
         out = {
             "timestamp": row.get("timestamp", ""),
@@ -870,11 +907,12 @@ with timeline_path.open("w", newline="") as f_out:
             "ram_used_gb": f"{ram_used:.2f}",
             "ram_delta_from_start_gb": f"{ram_delta:.2f}",
             "ram_scope": ram_scope,
-            "cpu_expert_model_weights_est_gb": f"{cpu_est['expert_model_weights'] if in_phase4 else 0.0:.2f}",
-            "cpu_expert_gradients_est_gb": f"{cpu_est['expert_gradients'] if in_phase4 else 0.0:.2f}",
-            "cpu_expert_optimizer_adamw_est_gb": f"{cpu_est['expert_optimizer_adamw_m_v'] if in_phase4 else 0.0:.2f}",
-            "cpu_numa_workspace_est_low_gb": f"{cpu_est['numa_work_buffers_estimate_low'] if in_phase4 else 0.0:.2f}",
-            "cpu_numa_workspace_est_high_gb": f"{cpu_est['numa_work_buffers_estimate_high'] if in_phase4 else 0.0:.2f}",
+            "cpu_model_param_partitions_bf16_est_gb": f"{cpu_est['model_param_partitions_bf16'] if in_phase4 else 0.0:.2f}",
+            "cpu_gradient_partitions_bf16_est_gb": f"{cpu_est['gradient_partitions_bf16'] if in_phase4 else 0.0:.2f}",
+            "cpu_fp32_master_parameters_est_gb": f"{cpu_est['fp32_master_parameters'] if in_phase4 else 0.0:.2f}",
+            "cpu_optimizer_adamw_m_v_est_gb": f"{cpu_est['optimizer_adamw_m_v'] if in_phase4 else 0.0:.2f}",
+            "cpu_offload_buffers_est_low_gb": f"{cpu_est['offload_buffers_estimate_low'] if in_phase4 else 0.0:.2f}",
+            "cpu_offload_buffers_est_high_gb": f"{cpu_est['offload_buffers_estimate_high'] if in_phase4 else 0.0:.2f}",
             "cpu_other_or_not_yet_allocated_gb": f"{max(ram_delta - cpu_known_low, 0.0):.2f}",
             "attribution_note": (
                 f"totals measured as {ram_scope}/{gpu_scope}; "
@@ -922,8 +960,8 @@ for c in gpu_cols:
 
 print()
 print("Component attribution is estimate-based:")
-print("  GPU: non-expert model weights + gradients + AdamW states + activation/workspace estimate.")
-print("  CPU: expert BF16 weights + expert gradients + AdamW states + NUMA work buffer estimate.")
+print("  GPU: ZeRO-3 live parameter cache + gradient bucket + activation/workspace estimate.")
+print("  CPU: BF16 parameter/gradient partitions + FP32 master params + AdamW states + offload buffers.")
 print("  Exact optimizer/gradient ownership requires instrumentation inside the training process.")
 PYEOF
 }
@@ -956,7 +994,7 @@ run_phase4() {
     log "Mode: ${FT_MODE}  |  steps: ${PHASE4_STEPS}  |  GPUs: ${NUM_GPUS}  |  batch: ${TRAIN_BATCH_SIZE}  |  cutoff_len: ${CUTOFF_LEN}  |  GAS: ${GRAD_ACCUM_STEPS}"
     log "TPS measurement: skipping first ${WARMUP_SKIP} warmup steps"
     log "tokens/optimizer-step = ${NUM_GPUS} × ${TRAIN_BATCH_SIZE} × ${CUTOFF_LEN} × ${GRAD_ACCUM_STEPS} = $((NUM_GPUS * TRAIN_BATCH_SIZE * CUTOFF_LEN * GRAD_ACCUM_STEPS))"
-    log "Performance-only run: expert probes and GDB are disabled"
+    log "Performance-only run: extra probes and GDB are disabled"
 
     local t_start
     t_start=$(date +%s)
@@ -1063,9 +1101,9 @@ print(f"  TPS (peak)       : {tokens_per_step / min_t:.1f} tokens/sec")
 PYEOF
 
         echo ""
-        echo "--- P2 diagnosis (CPU backward speed) ---"
-        echo "  avg_sec > 120s  => backward_base_weight_grad is a serious bottleneck"
-        echo "  avg_sec > 300s  => DDP timeout risk"
+        echo "--- Host-offload bottleneck hint ---"
+        echo "  avg_sec > 120s  => inspect PCIe parameter prefetch and CPUAdam timing"
+        echo "  avg_sec > 300s  => distributed timeout risk"
 
         echo ""
         echo "--- MoE router aux loss (P4) ---"
@@ -1073,11 +1111,10 @@ PYEOF
              "${LOG_DIR}/phase4/${TRAIN_LOG_NAME}" 2>/dev/null | tail -10 || echo "  (no router aux loss found)"
 
         echo ""
-        echo "--- update_base_weights call count (P7) ---"
-        local upd_count
-        upd_count=$(grep -ci "update_base_weights\|re-quantize\|TP_MOE_SFT" \
-                    "${LOG_DIR}/phase4/${TRAIN_LOG_NAME}" 2>/dev/null || echo 0)
-        echo "  update_base_weights triggered: ${upd_count} times"
+        echo "--- DeepSpeed ZeRO-3 / CPU offload evidence ---"
+        grep -i "ZeRO.*stage 3\|offload_param\|offload_optimizer\|DeepSpeedCPUAdam\|cpu_adam" \
+             "${LOG_DIR}/phase4/${TRAIN_LOG_NAME}" 2>/dev/null | tail -30 \
+             || echo "  (no activation lines found; inspect the full log)"
 
         echo ""
         echo "--- NaN/Inf statistics (P5) ---"
@@ -1104,6 +1141,7 @@ generate_flops_analysis() {
         --timing-json "${timing_dir}/step_timing.json" \
         --model-config "${MODEL_PATH}/config.json" \
         --mode "${FT_MODE}" \
+        --backend deepspeed \
         --seq-len "${CUTOFF_LEN}" \
         --batch-size "${TRAIN_BATCH_SIZE}" \
         --gas "${GRAD_ACCUM_STEPS}" \
@@ -1134,7 +1172,7 @@ generate_summary() {
         echo "**微调方式**: ${FT_MODE}"
         echo "**日志目录**: \`${LOG_DIR}\`"
         echo "**训练日志**: \`${LOG_DIR}/phase4/${TRAIN_LOG_NAME}\`"
-        echo "**GPU 数量**: ${NUM_GPUS}（后端: AMXBF16，2 NUMA）"
+        echo "**GPU 数量**: ${NUM_GPUS}（后端: DeepSpeed ZeRO-3 CPU Offload，BF16）"
         echo "**模型**: Qwen3MoeForCausalLM（纯文本，48 层，128 experts）"
         echo "**数据集**: ${DATASET_NAME}（100 条，样本 >7000 tokens，截断至 ${CUTOFF_LEN}）"
         echo "**Batch/GAS/学习率**: ${TRAIN_BATCH_SIZE} / ${GRAD_ACCUM_STEPS} / ${LEARNING_RATE}"
@@ -1239,7 +1277,7 @@ PYEOF
                         "${LOG_DIR}/phase4_analysis.txt" 2>/dev/null | head -1 | xargs || true)
             [[ -z "${p2_status}" ]] && p2_status="待分析"
         fi
-        echo "| P2 | CPU backward 速度瓶颈 | ${p2_status} |"
+        echo "| P2 | ZeRO 参数预取 / CPUAdam 瓶颈 | ${p2_status} |"
 
         local p5_status="正常"
         for ph in phase4; do
@@ -1250,7 +1288,7 @@ PYEOF
             fi
         done
         echo "| P5 | SIGSEGV / NaN | ${p5_status} |"
-        echo "| P7 | update_base_weights 开销 | 见 phase4_analysis.txt / step_timing |"
+        echo "| P7 | ZeRO-3 / CPUAdam 启用状态 | 见 phase4_analysis.txt / train log |"
 
         echo ""
         echo "## 7. 可视化输出"
@@ -1322,13 +1360,16 @@ generate_session_config() {
         "${SESSION_DIR}" "${FINETUNE_SELECTION}" "${NUM_GPUS}" \
         "${TRAIN_BATCH_SIZE}" "${GRAD_ACCUM_STEPS}" "${CUTOFF_LEN}" \
         "${PHASE4_STEPS}" "${WARMUP_SKIP}" "${LEARNING_RATE}" \
-        "${LORA_RANK}" "${LORA_ALPHA}" "$(basename "${ACCEL_CONFIG}")" <<'PYEOF'
+        "${LORA_RANK}" "${LORA_ALPHA}" "$(basename "${DEEPSPEED_CONFIG}")" \
+        "${CONDA_ENV}" <<'PYEOF'
 import json
 import sys
 from pathlib import Path
 
 out = Path(sys.argv[1]) / "session_config.json"
 obj = {
+    "backend": "llamafactory_deepspeed_zero3_cpu_offload",
+    "conda_environment": sys.argv[13],
     "selection": sys.argv[2],
     "execution_order": ["full", "lora"] if sys.argv[2] == "both" else [sys.argv[2]],
     "shared_training_parameters": {
@@ -1340,7 +1381,7 @@ obj = {
         "warmup_skip": int(sys.argv[8]),
         "stable_step_interval": [int(sys.argv[8]) + 1, int(sys.argv[7])],
         "learning_rate": sys.argv[9],
-        "accelerate_config": sys.argv[12],
+        "deepspeed_config": sys.argv[12],
     },
     "lora_only_parameters": {
         "lora_rank": int(sys.argv[10]),
@@ -1469,7 +1510,7 @@ main() {
     local selection_display="${FINETUNE_SELECTION}"
     [[ "${FINETUNE_SELECTION}" == "both" ]] && selection_display="both (full -> lora)"
     echo ""
-    echo -e "${BOLD}Qwen3-30B-A3B KTransformers Fine-Tuning Performance Test (AMXBF16)${NC}"
+    echo -e "${BOLD}Qwen3-30B-A3B LLaMA-Factory + DeepSpeed ZeRO-3 Offload Performance Test (BF16)${NC}"
     echo -e "Time: $(run_time_display)"
     echo -e "Selection/order: ${selection_display}"
     echo -e "Dataset: ${DATASET_NAME} @ ${DATA_DIR}  (every sample >7000 tokens)"
