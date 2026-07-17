@@ -3,9 +3,9 @@
 Generate a real-FFT stress dataset for Qwen3-30B-A3B full fine-tuning.
 
 Requirement:
-  - cutoff_len is set to 1024.
+  - cutoff_len is set to 4096.
   - Every sample MUST tokenize to > 7000 tokens so that after truncation to
-    1024 every training step uses an identical sequence length (exactly 1024
+    4096 every training step uses an identical sequence length (exactly 4096
     real tokens, no padding), giving clean, comparable TPS / memory numbers.
 
 Output (written into this same directory, FFTtest/dataset/):

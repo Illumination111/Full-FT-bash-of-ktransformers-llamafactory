@@ -64,6 +64,25 @@ STEP_TIME_PATTERN = re.compile(
     r"(\d+)/\d+\s+\[[\d:]+<[\d:]+,\s*([\d.]+)\s*s/it\]"
 )
 
+
+def find_train_log(phase_dir: Path) -> Path:
+    """Return legacy train.log or a mode-labelled train_*.log."""
+    legacy = phase_dir / "train.log"
+    if legacy.exists():
+        return legacy
+    candidates = sorted(phase_dir.glob("train_*.log"))
+    return candidates[0] if candidates else legacy
+
+
+def infer_warmup_skip(phase_dir: Path) -> int:
+    timing_path = phase_dir / "step_timing" / "step_timing.json"
+    if timing_path.exists():
+        try:
+            return int(json.loads(timing_path.read_text()).get("warmup_skip", WARMUP_SKIP))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+    return WARMUP_SKIP if phase_dir.name == "phase4" else 0
+
 # --------------------------------------------------------------------------- #
 # 解析 monitor.csv
 # --------------------------------------------------------------------------- #
@@ -178,7 +197,7 @@ def load_monitor_csv(csv_path: Path) -> dict:
 # --------------------------------------------------------------------------- #
 def load_trainer_logs(log_dir: Path) -> dict:
     """
-    扫描 <log_dir>/phase*/train.log 和 phase*/model_output/trainer_log.jsonl
+    扫描 <log_dir>/phase*/train*.log 和 phase*/model_output/trainer_log.jsonl
     返回 {phase_name: {"steps": [], "loss": [], "grad_norm": [], "lr": [], "nan_lines": []}}
     """
     result = {}
@@ -211,8 +230,8 @@ def load_trainer_logs(log_dir: Path) -> dict:
             except Exception:
                 pass
 
-        # 方式2：从 train.log 正则提取（fallback）
-        train_log = phase_dir / "train.log"
+        # 方式2：从 train*.log 正则提取（fallback）
+        train_log = find_train_log(phase_dir)
         if train_log.exists() and not steps:
             loss_pattern = re.compile(
                 r"['\"]?loss['\"]?\s*[=:]\s*([0-9]+\.?[0-9]*(?:e[+-]?\d+)?)",
@@ -289,6 +308,10 @@ def infer_num_gpus(log_dir: Path) -> int:
             m = re.search(r"(?:GPU count|GPU 数量)\*\*:\s*(\d+)", text)
             if m:
                 return int(m.group(1))
+    for part in reversed(log_dir.parts):
+        m = re.search(r"(?:^|_)(\d+)gpu(?:_|$)", part, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
     return 1
 
 
@@ -313,7 +336,7 @@ def load_tps_data(log_dir: Path) -> dict:
     for phase_dir in sorted(log_dir.iterdir()):
         if not phase_dir.is_dir() or not phase_dir.name.startswith("phase"):
             continue
-        train_log = phase_dir / "train.log"
+        train_log = find_train_log(phase_dir)
         if not train_log.exists():
             continue
 
@@ -331,7 +354,7 @@ def load_tps_data(log_dir: Path) -> dict:
         times = [t for _, t in steps_times]
         tps_vals = [tokens_per_step / t if t > 0 else 0.0 for t in times]
 
-        warmup_skip = WARMUP_SKIP if phase_dir.name == "phase4" else 0
+        warmup_skip = infer_warmup_skip(phase_dir)
         stable = [v for s, v in zip(steps, tps_vals) if s > warmup_skip]
         stable_avg = sum(stable) / len(stable) if stable else None
 
@@ -955,14 +978,14 @@ def generate_summary_md(
                 p2_result = f"稳定步均 {float(m2.group(1)):.1f}s（见 phase4_analysis）"
     lines.append(f"| P2 | CPU backward 速度瓶颈 | {p2_result} |")
 
-    p4_log = log_dir / "phase4" / "train.log"
+    p4_log = find_train_log(log_dir / "phase4")
     p4_moe = "无专项数据（需路由统计 hook）"
     if p4_log.exists():
         text = p4_log.read_text(errors="replace")
         if re.search(r"aux_loss|balance_loss|router_loss", text, re.IGNORECASE):
-            p4_moe = "检测到路由辅助损失，见 phase4/train.log"
+            p4_moe = f"检测到路由辅助损失，见 phase4/{p4_log.name}"
         elif re.search(r"expert.*token|token.*expert", text, re.IGNORECASE):
-            p4_moe = "检测到 expert 路由日志，见 phase4/train.log"
+            p4_moe = f"检测到 expert 路由日志，见 phase4/{p4_log.name}"
     lines.append(f"| P4 | MoE 路由负载均衡 | {p4_moe} |")
 
     p5_results = []
@@ -970,13 +993,16 @@ def generate_summary_md(
         tl = trainer_logs.get(ph, {})
         if tl.get("nan_lines"):
             p5_results.append(f"{ph}(行:{tl['nan_lines'][:3]})")
-        ec = exit_codes.get(ph)
-        if ec and ec < 0:
-            log_f = log_dir / ph / "train.log"
-            if log_f.exists() and re.search(
-                r"sigsegv|segfault|core dump", log_f.read_text(errors="replace"), re.IGNORECASE
-            ):
-                p5_results.append(f"{ph}:SIGSEGV")
+        # The phase exit-code file contains the outer accelerate launcher status
+        # (usually 1), while torch elastic records the crashed child as -11 in
+        # train.log.  Detect SIGSEGV from the raw log regardless of launcher code.
+        log_f = find_train_log(log_dir / ph)
+        if log_f.exists() and re.search(
+            r"sigsegv|segfault|segmentation fault|signal\s+11|core dump(?:ed)?",
+            log_f.read_text(errors="replace"),
+            re.IGNORECASE,
+        ):
+            p5_results.append(f"{ph}:SIGSEGV")
     p5_result = "、".join(p5_results) if p5_results else "✓ 未检测到 NaN/Inf/崩溃"
     if p5_results:
         p5_result = "⚠ " + p5_result
@@ -1009,7 +1035,7 @@ def generate_summary_md(
         if job_path.exists():
             job_timing = json.loads(job_path.read_text())
         else:
-            job_timing = parse_job_timing_from_train_log(log_dir / "phase4" / "train.log")
+            job_timing = parse_job_timing_from_train_log(find_train_log(log_dir / "phase4"))
             job_path.write_text(json.dumps(job_timing, indent=2, ensure_ascii=False))
 
         lines.append("## 5. TPS 瓶颈拆解与计时文件")
@@ -1051,7 +1077,35 @@ def generate_summary_md(
     else:
         lines.append("- 无 `stall_events.json`（需 `KT_STALL_WATCH=1`）")
 
-    lines += ["", "---", "", "## 6. Expert 基座权重变化检查", ""]
+    lines += ["", "---", "", "## 6. Expert 梯度与基座权重检查", ""]
+    lines += ["### 6.1 optimizer 前专家梯度", ""]
+    lines.append("- 方法: 完整扫描每层 `grad_gate/up/down_proj_buf` 及对应 `Parameter.grad`")
+    lines.append(f"- 文本报告: `{log_dir / 'expert_gradient_check.txt'}`")
+    lines.append(f"- JSON 报告: `{log_dir / 'expert_gradient_check.json'}`")
+    lines.append(f"- 原始 probe: `{log_dir / 'phase4' / 'expert_grad_probe.json'}`")
+    grad_report = log_dir / "expert_gradient_check.json"
+    if grad_report.exists():
+        try:
+            grad_data = json.loads(grad_report.read_text())
+            lines.append(f"- 状态: **{grad_data.get('status', 'UNKNOWN')}**")
+            if grad_data.get("reason"):
+                lines.append(f"- 原因: {grad_data['reason']}")
+            for step in grad_data.get("steps") or []:
+                grad_summary = step.get("summary") or {}
+                lines.append(
+                    f"- Step {step.get('optimizer_step')}: LR={step.get('learning_rates', [])}，"
+                    f"非零 C++ buffer={grad_summary.get('nonzero_grad_buffers', 0)}/"
+                    f"{grad_summary.get('ok_records', 0)}，"
+                    f"非零 Parameter.grad={grad_summary.get('nonzero_parameter_grads', 0)}/"
+                    f"{grad_summary.get('ok_records', 0)}，"
+                    f"非有限={grad_summary.get('nonfinite_grad_buffers', 0) + grad_summary.get('nonfinite_parameter_grads', 0)}"
+                )
+        except Exception as exc:
+            lines.append(f"- 解析失败: {exc}")
+    else:
+        lines.append("- （未运行 expert 梯度检查）")
+
+    lines += ["", "### 6.2 Expert 基座权重变化", ""]
     lines.append("- 方法: 训练中采样 KT `gate/up/down_proj_buf`（非 HF checkpoint）")
     lines.append(f"- 文本报告: `{log_dir / 'expert_weight_change_check.txt'}`")
     lines.append(f"- JSON 报告: `{log_dir / 'expert_weight_change_check.json'}`")

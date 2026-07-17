@@ -16,7 +16,10 @@ trust_remote_code: true
 stage: sft
 do_train: true
 finetuning_type: full
-# full mode: lora_rank/lora_target are not applicable
+# LLaMA-Factory defaults lora_rank to 8, and the KT plugin also reads it in full
+# mode. Set it explicitly to 0 so this remains pure Full FT rather than
+# Full + LoRA hybrid training.
+lora_rank: 0
 # Real full FT is gated by env ACCELERATE_KT_TRAIN_MODE=full (set by the runner)
 
 ### dataset

@@ -34,6 +34,9 @@
 
 set -euo pipefail
 
+# Keep run-directory names and all child-process logs in the expected local time.
+export TZ="${FFT_TIMEZONE:-Asia/Shanghai}"
+
 # --------------------------------------------------------------------------- #
 # Path configuration
 # --------------------------------------------------------------------------- #

@@ -1,4 +1,4 @@
-"""Per-step Full-FT timing probe for KTransformers / HuggingFace Trainer.
+"""Per-step Full/LoRA timing probe for KTransformers or DeepSpeed/HF Trainer.
 
 Aligns with tqdm s/it (TPS denominator) by timing one optimizer-step cycle as:
   get_batch_samples (dataloader)
@@ -98,10 +98,14 @@ class StepTimingRecorder:
         out_dir: Path,
         warmup_skip: int = 0,
         tokens_per_step: int = 0,
+        finetune_mode: str = "unknown",
+        backend: str = "kt",
     ) -> None:
         self.out_dir = Path(out_dir)
         self.warmup_skip = warmup_skip
         self.tokens_per_step = tokens_per_step
+        self.finetune_mode = finetune_mode
+        self.backend = backend
         self.steps: list[dict[str, Any]] = []
         self._cur: dict[str, float] | None = None
         self._step_t0: float | None = None
@@ -111,6 +115,7 @@ class StepTimingRecorder:
         self.enabled = True
         # Nested phase stack: child time is excluded from parent (e.g. requant in forward).
         self._stack: list[tuple[str, float, float]] = []  # (key, t0, child_sec)
+        self.backward_timing = None
 
     def begin_cycle(self) -> None:
         """Start a TPS-aligned step cycle (usually at get_batch_samples)."""
@@ -204,7 +209,8 @@ class StepTimingRecorder:
             f"step={row['global_step']} total={row['step_total_sec']:.3f}s "
             f"data={row['dataloader_sec']:.3f}s "
             f"fwd={row['forward_sec']:.3f}s bwd={row['backward_sec']:.3f}s "
-            f"optim={row['optimizer_sec']:.3f}s requant={row['update_base_weights_sec']:.3f}s "
+            f"optim={row['optimizer_sec']:.3f}s post={row['post_optim_sec']:.3f}s "
+            f"requant={row['update_base_weights_sec']:.3f}s "
             f"log={row['log_save_eval_sec']:.3f}s other={row['step_other_sec']:.3f}s",
             flush=True,
         )
@@ -246,9 +252,41 @@ class StepTimingRecorder:
         stable = [r for r in self.steps if int(r["global_step"]) > self.warmup_skip]
         agg_stable = _agg(stable)
         tps_attr = build_tps_attribution(agg_stable, self.tokens_per_step)
+        if self.backend == "deepspeed":
+            phase_legend = {
+                "dataloader_sec": "get_batch_samples / DataLoader next (before on_step_begin; in tqdm s/it)",
+                "data_prep_sec": "input prepare / device transfer before forward",
+                "forward_sec": "GPU model forward + loss, including ZeRO-3 parameter prefetch",
+                "backward_sec": "accelerator.backward / GPU autograd + ZeRO-3 gradient partitioning/offload",
+                "clip_grad_sec": "gradient clipping",
+                "optimizer_sec": "optimizer.step (DeepSpeedCPUAdam with CPU-offloaded states)",
+                "post_optim_sec": "lr_scheduler + zero_grad",
+                "update_base_weights_sec": "KT-only metric; expected to remain zero for DeepSpeed",
+                "log_save_eval_sec": "_maybe_log_save_evaluate (metric log / checkpoint / eval)",
+                "step_other_sec": "unaccounted wall time inside the TPS cycle",
+                "step_total_sec": "TPS cycle wall: dataloader → train → log/save (matches tqdm s/it)",
+            }
+        else:
+            phase_legend = {
+                "dataloader_sec": "get_batch_samples / DataLoader next (before on_step_begin; in tqdm s/it)",
+                "data_prep_sec": "input prepare / device transfer before forward",
+                "forward_sec": "model forward + loss (compute_loss), exclusive of nested requant",
+                "backward_sec": "accelerator.backward / autograd (CPU AMX expert backward plus GPU autograd)",
+                "clip_grad_sec": "gradient clipping",
+                "optimizer_sec": (
+                    "optimizer.step (KT Full: GPU AdamW + CPU DeepSpeedCPUAdam; LoRA: AdamW)"
+                ),
+                "post_optim_sec": "KT pointer sync + lr_scheduler + GPU/CPU optimizer zero_grad",
+                "update_base_weights_sec": "KT update_base_weights / online requant (often nested inside next forward)",
+                "log_save_eval_sec": "_maybe_log_save_evaluate (metric log / checkpoint / eval)",
+                "step_other_sec": "unaccounted wall time inside the TPS cycle",
+                "step_total_sec": "TPS cycle wall: dataloader → train → log/save (matches tqdm s/it)",
+            }
         return {
             "status": "OK",
             "warmup_skip": self.warmup_skip,
+            "finetune_mode": self.finetune_mode,
+            "backend": self.backend,
             "tokens_per_step": self.tokens_per_step,
             "num_steps": len(self.steps),
             "num_stable_steps": len(stable),
@@ -256,19 +294,7 @@ class StepTimingRecorder:
             "aggregate_all": _agg(self.steps),
             "aggregate_stable": agg_stable,
             "tps_attribution": tps_attr,
-            "phase_legend": {
-                "dataloader_sec": "get_batch_samples / DataLoader next (before on_step_begin; in tqdm s/it)",
-                "data_prep_sec": "input prepare / device transfer before forward",
-                "forward_sec": "model forward + loss (compute_loss), exclusive of nested requant",
-                "backward_sec": "accelerator.backward / autograd (CPU AMX expert backward dominates in Full FT)",
-                "clip_grad_sec": "gradient clipping",
-                "optimizer_sec": "optimizer.step (AdamW on GPU non-expert + CPU expert buffers)",
-                "post_optim_sec": "KT pointer sync + lr_scheduler + zero_grad",
-                "update_base_weights_sec": "KT update_base_weights / online requant (often nested inside next forward)",
-                "log_save_eval_sec": "_maybe_log_save_evaluate (metric log / checkpoint / eval)",
-                "step_other_sec": "unaccounted wall time inside the TPS cycle",
-                "step_total_sec": "TPS cycle wall: dataloader → train → log/save (matches tqdm s/it)",
-            },
+            "phase_legend": phase_legend,
         }
 
     def flush(self) -> dict[str, Any]:
@@ -341,7 +367,8 @@ def build_tps_attribution(agg: dict[str, Any], tokens_per_step: int) -> dict[str
 
 def render_timing_markdown(summary: dict[str, Any]) -> str:
     lines: list[str] = []
-    lines.append("# Full-FT Step Timing Breakdown")
+    mode = summary.get("finetune_mode", "unknown")
+    lines.append(f"# {mode} Fine-Tuning Step Timing Breakdown")
     lines.append("")
     if summary.get("status") != "OK":
         lines.append(f"status: {summary.get('status')}")
@@ -408,9 +435,9 @@ def render_timing_markdown(summary: dict[str, Any]) -> str:
     lines.append("")
     rows = summary.get("steps") or []
     lines.append(
-        "| step | total | data | forward | backward | optim | requant | log | other |"
+        "| step | total | data | forward | backward | optim | post-optim | requant | log | other |"
     )
-    lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     if len(rows) <= 24:
         show_rows = rows
         omit_at = None
@@ -419,11 +446,12 @@ def render_timing_markdown(summary: dict[str, Any]) -> str:
         omit_at = 8
     for i, r in enumerate(show_rows):
         if omit_at is not None and i == omit_at:
-            lines.append("| ... | ... | ... | ... | ... | ... | ... | ... | ... |")
+            lines.append("| ... | ... | ... | ... | ... | ... | ... | ... | ... | ... |")
         lines.append(
             f"| {r['global_step']} | {r['step_total_sec']:.3f} | {r['dataloader_sec']:.3f} | "
             f"{r['forward_sec']:.3f} | {r['backward_sec']:.3f} | {r['optimizer_sec']:.3f} | "
-            f"{r['update_base_weights_sec']:.3f} | {r['log_save_eval_sec']:.3f} | {r['step_other_sec']:.3f} |"
+            f"{r['post_optim_sec']:.3f} | {r['update_base_weights_sec']:.3f} | "
+            f"{r['log_save_eval_sec']:.3f} | {r['step_other_sec']:.3f} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -436,6 +464,7 @@ def parse_job_timing_from_train_log(train_log: Path | str) -> dict[str, Any]:
         return {"status": "MISSING", "reason": f"no file: {path}"}
 
     text = path.read_text(errors="replace")
+    backend = "deepspeed" if re.search(r"DeepSpeed|ZeRO[- ]?3|cpu_adam", text, re.I) else "kt"
     ts_pat = re.compile(r"(20\d{2}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 
     def _near_ts(pos: int) -> datetime | None:
@@ -464,6 +493,7 @@ def parse_job_timing_from_train_log(train_log: Path | str) -> dict[str, Any]:
         ("dataset_load", r"Loading dataset"),
         ("model_config", r"loading configuration file"),
         ("kt_inject", r"Injected \d+ fused expert"),
+        ("deepspeed_init", r"DeepSpeed.*info|ZeRO[- ]?3|DeepSpeedCPUAdam|cpu_adam"),
         ("running_training", r"\*+ Running training \*+"),
         ("train_metrics", r"train_runtime"),
     ):
@@ -478,14 +508,24 @@ def parse_job_timing_from_train_log(train_log: Path | str) -> dict[str, Any]:
             return None
         return max(0.0, (b - a).total_seconds())
 
-    segments = [
-        ("startup_to_dataset", markers["log_first_ts"], markers["dataset_load"]),
-        ("dataset_to_kt_inject", markers["dataset_load"], markers["kt_inject"]),
-        ("model_load_and_kt_inject", markers["log_first_ts"], markers["kt_inject"]),
-        ("kt_inject_to_train_loop", markers["kt_inject"], markers["running_training"]),
-        ("train_loop", markers["running_training"], markers["train_metrics"] or markers["log_last_ts"]),
-        ("job_wall_from_log_ts", markers["log_first_ts"], markers["log_last_ts"]),
-    ]
+    if backend == "deepspeed":
+        segments = [
+            ("startup_to_dataset", markers["log_first_ts"], markers["dataset_load"]),
+            ("dataset_to_deepspeed_init", markers["dataset_load"], markers["deepspeed_init"]),
+            ("model_load_and_deepspeed_init", markers["log_first_ts"], markers["deepspeed_init"]),
+            ("deepspeed_init_to_train_loop", markers["deepspeed_init"], markers["running_training"]),
+            ("train_loop", markers["running_training"], markers["train_metrics"] or markers["log_last_ts"]),
+            ("job_wall_from_log_ts", markers["log_first_ts"], markers["log_last_ts"]),
+        ]
+    else:
+        segments = [
+            ("startup_to_dataset", markers["log_first_ts"], markers["dataset_load"]),
+            ("dataset_to_kt_inject", markers["dataset_load"], markers["kt_inject"]),
+            ("model_load_and_kt_inject", markers["log_first_ts"], markers["kt_inject"]),
+            ("kt_inject_to_train_loop", markers["kt_inject"], markers["running_training"]),
+            ("train_loop", markers["running_training"], markers["train_metrics"] or markers["log_last_ts"]),
+            ("job_wall_from_log_ts", markers["log_first_ts"], markers["log_last_ts"]),
+        ]
     out_segments = []
     for name, a, b in segments:
         sec = _sec(a, b)
@@ -500,6 +540,7 @@ def parse_job_timing_from_train_log(train_log: Path | str) -> dict[str, Any]:
 
     return {
         "status": "OK",
+        "backend": backend,
         "markers": {k: (v.isoformat(sep=" ") if v else None) for k, v in markers.items()},
         "segments": out_segments,
         "online_quant_log_hits": online_quant_hits,
@@ -513,10 +554,12 @@ def parse_job_timing_from_train_log(train_log: Path | str) -> dict[str, Any]:
 def render_summary_timing_section(
     step_timing: dict[str, Any] | None,
     job_timing: dict[str, Any] | None = None,
+    finetune_mode: str | None = None,
 ) -> str:
     """Markdown block for Chinese summary.md."""
     lines: list[str] = []
-    lines.append("## TPS 瓶颈拆解（Full-FT Step Timing）")
+    mode = finetune_mode or (step_timing or {}).get("finetune_mode") or "unknown"
+    lines.append(f"## TPS 瓶颈拆解（{mode} Step Timing）")
     lines.append("")
 
     if not step_timing or step_timing.get("status") != "OK":
@@ -524,6 +567,7 @@ def render_summary_timing_section(
         lines.append("")
     else:
         agg = step_timing.get("aggregate_stable") or step_timing.get("aggregate_all") or {}
+        backend = step_timing.get("backend", "kt")
         tps = step_timing.get("tps_attribution") or build_tps_attribution(
             agg, int(step_timing.get("tokens_per_step") or 0)
         )
@@ -556,13 +600,25 @@ def render_summary_timing_section(
             share_s = f"{share * 100:.1f}%" if share is not None else "-"
             hint = ""
             if key == "backward_sec":
-                hint = "CPU AMX expert backward（P2）"
+                hint = (
+                    "GPU autograd + ZeRO-3 梯度分片/卸载"
+                    if backend == "deepspeed"
+                    else "CPU AMX expert backward；Full 含基座 dW，LoRA 只含基座 dX + adapter 梯度"
+                )
             elif key == "update_base_weights_sec":
-                hint = "online requant（P7）"
+                hint = "DeepSpeed 下应为 0" if backend == "deepspeed" else "online requant（P7）"
             elif key == "forward_sec":
-                hint = "含 GPU attention + CPU expert forward"
+                hint = (
+                    "GPU 全模型 forward + ZeRO-3 参数预取"
+                    if backend == "deepspeed"
+                    else "含 GPU attention + CPU expert forward"
+                )
             elif key == "optimizer_sec":
-                hint = "AdamW（GPU non-expert + CPU expert buf）"
+                hint = (
+                    "DeepSpeedCPUAdam；优化器状态在 CPU"
+                    if backend == "deepspeed"
+                    else "AdamW；参数规模随 Full/LoRA 模式变化"
+                )
             elif key == "dataloader_sec":
                 hint = "DataLoader；过大说明输入侧卡住"
             elif key == "log_save_eval_sec":
@@ -600,6 +656,9 @@ def render_summary_timing_section(
             "dataset_to_kt_inject": "数据集→KT inject",
             "model_load_and_kt_inject": "模型加载+KT inject",
             "kt_inject_to_train_loop": "inject→训练循环",
+            "dataset_to_deepspeed_init": "数据集→DeepSpeed 初始化",
+            "model_load_and_deepspeed_init": "模型加载+DeepSpeed 初始化",
+            "deepspeed_init_to_train_loop": "DeepSpeed 初始化→训练循环",
             "train_loop": "训练循环",
             "job_wall_from_log_ts": "整次 job 墙钟（日志）",
         }
@@ -611,7 +670,8 @@ def render_summary_timing_section(
                 f"| {name} | {sec_s} | {seg.get('start') or '?'} → {seg.get('end') or '?'} |"
             )
         lines.append("")
-        lines.append(f"- online_quant 日志命中次数: {job_timing.get('online_quant_log_hits', 0)}")
+        if job_timing.get("backend", "kt") != "deepspeed":
+            lines.append(f"- online_quant 日志命中次数: {job_timing.get('online_quant_log_hits', 0)}")
         lines.append("")
 
     return "\n".join(lines)
@@ -622,7 +682,11 @@ class StepTimingCallback(TrainerCallback):
         super().__init__()
         self.recorder = recorder
         self._clip_wrapped = False
-        self._opt_wrapped = False
+        # Trainer can replace the optimizer after create_optimizer(), notably
+        # when KT Full FT installs KTHybridOptimizer after accelerator.prepare().
+        # Track identities so both the original optimizer and the final facade
+        # can be wrapped exactly once.
+        self._wrapped_optimizer_ids: set[int] = set()
         self._sched_wrapped = False
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
@@ -643,12 +707,22 @@ class StepTimingCallback(TrainerCallback):
 
     def on_step_begin(self, args, state, control, **kwargs):
         self.recorder.on_step_begin()
+        if self.recorder.backward_timing is not None:
+            self.recorder.backward_timing.begin_step(int(getattr(state, "global_step", 0) or 0) + 1)
 
     def on_step_end(self, args, state, control, **kwargs):
-        self.recorder.on_step_end(int(getattr(state, "global_step", 0) or 0))
+        global_step = int(getattr(state, "global_step", 0) or 0)
+        if self.recorder.backward_timing is not None:
+            self.recorder.backward_timing.end_step(
+                global_step,
+                float(self.recorder._accum.get("backward_sec", 0.0)),
+            )
+        self.recorder.on_step_end(global_step)
 
     def on_train_end(self, args, state, control, **kwargs):
         self.recorder.flush()
+        if self.recorder.backward_timing is not None:
+            self.recorder.backward_timing.flush()
 
     def _wrap_trainer_optim_path(self, trainer: Any) -> None:
         rec = self.recorder
@@ -667,7 +741,7 @@ class StepTimingCallback(TrainerCallback):
             self._clip_wrapped = True
 
         opt = getattr(trainer, "optimizer", None)
-        if (not self._opt_wrapped) and opt is not None:
+        if opt is not None and id(opt) not in self._wrapped_optimizer_ids:
             # IMPORTANT: preserve original signatures. AcceleratedOptimizer.zero_grad
             # uses inspect.signature(...).parameters to decide whether set_to_none is
             # supported; a bare (*a, **k) wrapper strips set_to_none and crashes KT
@@ -695,7 +769,8 @@ class StepTimingCallback(TrainerCallback):
                     rec.end_phase("post_optim_sec")
 
             opt.zero_grad = timed_zero
-            self._opt_wrapped = True
+            self._wrapped_optimizer_ids.add(id(opt))
+            print(f"[step_timing] optimizer wrapped: {type(opt).__name__}", flush=True)
 
         sched = getattr(trainer, "lr_scheduler", None)
         if (not self._sched_wrapped) and sched is not None:
@@ -771,11 +846,16 @@ def _patch_training_step(recorder: StepTimingRecorder) -> None:
                 recorder.end_phase("forward_sec")
 
         def timed_backward(*a, **k):
+            backward_timing = recorder.backward_timing
+            if backward_timing is not None:
+                backward_timing.begin_microbatch()
             recorder.begin_phase("backward_sec")
             try:
                 return orig_backward(*a, **k)
             finally:
                 recorder.end_phase("backward_sec")
+                if backward_timing is not None:
+                    backward_timing.end_microbatch()
 
         self._prepare_inputs = timed_prepare
         self.compute_loss = timed_compute_loss
@@ -861,7 +941,27 @@ def install_step_timing() -> StepTimingRecorder | None:
     out_dir = Path(os.environ.get("KT_STEP_TIMING_OUT_DIR", "step_timing_out"))
     warmup = _env_int("KT_STEP_TIMING_WARMUP_SKIP", 0)
     tokens = _env_int("KT_STEP_TIMING_TOKENS_PER_STEP", 0)
-    recorder = StepTimingRecorder(out_dir=out_dir, warmup_skip=warmup, tokens_per_step=tokens)
+    finetune_mode = os.environ.get("KT_FINETUNE_MODE", "unknown")
+    backend = os.environ.get("FFT_TRAINING_BACKEND", "kt").lower()
+    recorder = StepTimingRecorder(
+        out_dir=out_dir,
+        warmup_skip=warmup,
+        tokens_per_step=tokens,
+        finetune_mode=finetune_mode,
+        backend=backend,
+    )
+    if os.environ.get("KT_BACKWARD_TIMING", "off").strip().lower() not in ("", "0", "off"):
+        try:
+            from kt_kernel.sft.backward_timing import get_backward_timing_recorder
+
+            recorder.backward_timing = get_backward_timing_recorder()
+            print(
+                f"[backward_timing] mode={recorder.backward_timing.mode} "
+                f"-> {recorder.backward_timing.out_dir}",
+                flush=True,
+            )
+        except Exception as exc:
+            raise RuntimeError("Failed to initialize KT backward internal timing") from exc
 
     _patch_get_batch_samples(recorder)
     _patch_training_step(recorder)
