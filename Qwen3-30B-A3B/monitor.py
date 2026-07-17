@@ -373,7 +373,11 @@ class Monitor:
     def _fifo_reader(self) -> None:
         while self._running:
             try:
-                with open(self.fifo_path, "r") as f:
+                # Keep a writer endpoint open for the monitor lifetime.  A
+                # read-only FIFO sees EOF whenever a short-lived event writer
+                # closes, creating a reopen race that can SIGPIPE the runner.
+                fd = os.open(self.fifo_path, os.O_RDWR)
+                with os.fdopen(fd, "r") as f:
                     for line in f:
                         line = line.strip()
                         if not line:

@@ -115,6 +115,7 @@ class StepTimingRecorder:
         self.enabled = True
         # Nested phase stack: child time is excluded from parent (e.g. requant in forward).
         self._stack: list[tuple[str, float, float]] = []  # (key, t0, child_sec)
+        self.backward_timing = None
 
     def begin_cycle(self) -> None:
         """Start a TPS-aligned step cycle (usually at get_batch_samples)."""
@@ -208,7 +209,8 @@ class StepTimingRecorder:
             f"step={row['global_step']} total={row['step_total_sec']:.3f}s "
             f"data={row['dataloader_sec']:.3f}s "
             f"fwd={row['forward_sec']:.3f}s bwd={row['backward_sec']:.3f}s "
-            f"optim={row['optimizer_sec']:.3f}s requant={row['update_base_weights_sec']:.3f}s "
+            f"optim={row['optimizer_sec']:.3f}s post={row['post_optim_sec']:.3f}s "
+            f"requant={row['update_base_weights_sec']:.3f}s "
             f"log={row['log_save_eval_sec']:.3f}s other={row['step_other_sec']:.3f}s",
             flush=True,
         )
@@ -271,8 +273,10 @@ class StepTimingRecorder:
                 "forward_sec": "model forward + loss (compute_loss), exclusive of nested requant",
                 "backward_sec": "accelerator.backward / autograd (CPU AMX expert backward plus GPU autograd)",
                 "clip_grad_sec": "gradient clipping",
-                "optimizer_sec": "optimizer.step (AdamW on mode-specific trainable GPU/CPU parameters)",
-                "post_optim_sec": "KT pointer sync + lr_scheduler + zero_grad",
+                "optimizer_sec": (
+                    "optimizer.step (KT Full: GPU AdamW + CPU DeepSpeedCPUAdam; LoRA: AdamW)"
+                ),
+                "post_optim_sec": "KT pointer sync + lr_scheduler + GPU/CPU optimizer zero_grad",
                 "update_base_weights_sec": "KT update_base_weights / online requant (often nested inside next forward)",
                 "log_save_eval_sec": "_maybe_log_save_evaluate (metric log / checkpoint / eval)",
                 "step_other_sec": "unaccounted wall time inside the TPS cycle",
@@ -431,9 +435,9 @@ def render_timing_markdown(summary: dict[str, Any]) -> str:
     lines.append("")
     rows = summary.get("steps") or []
     lines.append(
-        "| step | total | data | forward | backward | optim | requant | log | other |"
+        "| step | total | data | forward | backward | optim | post-optim | requant | log | other |"
     )
-    lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     if len(rows) <= 24:
         show_rows = rows
         omit_at = None
@@ -442,11 +446,12 @@ def render_timing_markdown(summary: dict[str, Any]) -> str:
         omit_at = 8
     for i, r in enumerate(show_rows):
         if omit_at is not None and i == omit_at:
-            lines.append("| ... | ... | ... | ... | ... | ... | ... | ... | ... |")
+            lines.append("| ... | ... | ... | ... | ... | ... | ... | ... | ... | ... |")
         lines.append(
             f"| {r['global_step']} | {r['step_total_sec']:.3f} | {r['dataloader_sec']:.3f} | "
             f"{r['forward_sec']:.3f} | {r['backward_sec']:.3f} | {r['optimizer_sec']:.3f} | "
-            f"{r['update_base_weights_sec']:.3f} | {r['log_save_eval_sec']:.3f} | {r['step_other_sec']:.3f} |"
+            f"{r['post_optim_sec']:.3f} | {r['update_base_weights_sec']:.3f} | "
+            f"{r['log_save_eval_sec']:.3f} | {r['step_other_sec']:.3f} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -677,7 +682,11 @@ class StepTimingCallback(TrainerCallback):
         super().__init__()
         self.recorder = recorder
         self._clip_wrapped = False
-        self._opt_wrapped = False
+        # Trainer can replace the optimizer after create_optimizer(), notably
+        # when KT Full FT installs KTHybridOptimizer after accelerator.prepare().
+        # Track identities so both the original optimizer and the final facade
+        # can be wrapped exactly once.
+        self._wrapped_optimizer_ids: set[int] = set()
         self._sched_wrapped = False
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
@@ -698,12 +707,22 @@ class StepTimingCallback(TrainerCallback):
 
     def on_step_begin(self, args, state, control, **kwargs):
         self.recorder.on_step_begin()
+        if self.recorder.backward_timing is not None:
+            self.recorder.backward_timing.begin_step(int(getattr(state, "global_step", 0) or 0) + 1)
 
     def on_step_end(self, args, state, control, **kwargs):
-        self.recorder.on_step_end(int(getattr(state, "global_step", 0) or 0))
+        global_step = int(getattr(state, "global_step", 0) or 0)
+        if self.recorder.backward_timing is not None:
+            self.recorder.backward_timing.end_step(
+                global_step,
+                float(self.recorder._accum.get("backward_sec", 0.0)),
+            )
+        self.recorder.on_step_end(global_step)
 
     def on_train_end(self, args, state, control, **kwargs):
         self.recorder.flush()
+        if self.recorder.backward_timing is not None:
+            self.recorder.backward_timing.flush()
 
     def _wrap_trainer_optim_path(self, trainer: Any) -> None:
         rec = self.recorder
@@ -722,7 +741,7 @@ class StepTimingCallback(TrainerCallback):
             self._clip_wrapped = True
 
         opt = getattr(trainer, "optimizer", None)
-        if (not self._opt_wrapped) and opt is not None:
+        if opt is not None and id(opt) not in self._wrapped_optimizer_ids:
             # IMPORTANT: preserve original signatures. AcceleratedOptimizer.zero_grad
             # uses inspect.signature(...).parameters to decide whether set_to_none is
             # supported; a bare (*a, **k) wrapper strips set_to_none and crashes KT
@@ -750,7 +769,8 @@ class StepTimingCallback(TrainerCallback):
                     rec.end_phase("post_optim_sec")
 
             opt.zero_grad = timed_zero
-            self._opt_wrapped = True
+            self._wrapped_optimizer_ids.add(id(opt))
+            print(f"[step_timing] optimizer wrapped: {type(opt).__name__}", flush=True)
 
         sched = getattr(trainer, "lr_scheduler", None)
         if (not self._sched_wrapped) and sched is not None:
@@ -826,11 +846,16 @@ def _patch_training_step(recorder: StepTimingRecorder) -> None:
                 recorder.end_phase("forward_sec")
 
         def timed_backward(*a, **k):
+            backward_timing = recorder.backward_timing
+            if backward_timing is not None:
+                backward_timing.begin_microbatch()
             recorder.begin_phase("backward_sec")
             try:
                 return orig_backward(*a, **k)
             finally:
                 recorder.end_phase("backward_sec")
+                if backward_timing is not None:
+                    backward_timing.end_microbatch()
 
         self._prepare_inputs = timed_prepare
         self.compute_loss = timed_compute_loss
@@ -925,6 +950,18 @@ def install_step_timing() -> StepTimingRecorder | None:
         finetune_mode=finetune_mode,
         backend=backend,
     )
+    if os.environ.get("KT_BACKWARD_TIMING", "off").strip().lower() not in ("", "0", "off"):
+        try:
+            from kt_kernel.sft.backward_timing import get_backward_timing_recorder
+
+            recorder.backward_timing = get_backward_timing_recorder()
+            print(
+                f"[backward_timing] mode={recorder.backward_timing.mode} "
+                f"-> {recorder.backward_timing.out_dir}",
+                flush=True,
+            )
+        except Exception as exc:
+            raise RuntimeError("Failed to initialize KT backward internal timing") from exc
 
     _patch_get_batch_samples(recorder)
     _patch_training_step(recorder)
