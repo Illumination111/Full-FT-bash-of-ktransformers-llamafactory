@@ -5,7 +5,7 @@ Qwen3-30B-A3B FFT 测试结果分析与可视化
 功能：
   1. 解析 monitor.csv（GPU 显存、CPU RAM、CPU 利用率）
   2. 解析 LLaMA-Factory 训练日志（loss、grad_norm、学习率）
-  3. 生成 7 张可视化图（保存到 <log_dir>/plots/）
+  3. 生成 3 张可视化图（保存到 <log_dir>/plots/）
   4. 生成中文 summary.md（合并原英文 SUMMARY 内容；不再保留 SUMMARY.md）
 
 用法：
@@ -14,11 +14,7 @@ Qwen3-30B-A3B FFT 测试结果分析与可视化
 图表列表：
     01_gpu_memory.png      - 各 GPU 显存占用时序
     02_cpu_ram.png         - CPU RAM 时序
-    03_training_loss.png   - 训练 loss 曲线（各 Phase）
-    04_grad_norm.png       - 梯度范数曲线（各 Phase）
-    05_nan_inf_timeline.png- NaN/Inf/崩溃事件时间线
-    06_phase_summary.png   - 各 Phase 性能对比表（步均耗时、峰值显存等）
-    07_tps.png             - 逐步 TPS 曲线（phase4 为主，含 warmup 区间标注）
+    03_tps.png             - 逐步 TPS 曲线（phase4 为主，含 warmup 区间标注）
 """
 
 import argparse
@@ -33,7 +29,6 @@ try:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    import matplotlib.ticker as mticker
     _HAS_MPL = True
 except ImportError:
     _HAS_MPL = False
@@ -63,6 +58,14 @@ WARMUP_SKIP = 5  # 与 run_fft_test.sh 一致，计算稳定 TPS 时跳过前 N 
 STEP_TIME_PATTERN = re.compile(
     r"(\d+)/\d+\s+\[[\d:]+<[\d:]+,\s*([\d.]+)\s*s/it\]"
 )
+LEGACY_PLOT_NAMES = (
+    "03_training_loss.png",
+    "04_grad_norm.png",
+    "05_nan_inf_timeline.png",
+    "06_phase_summary.png",
+)
+LEGACY_TPS_PLOT_NAME = "07_tps.png"
+TPS_PLOT_NAME = "03_tps.png"
 
 
 def find_train_log(phase_dir: Path) -> Path:
@@ -394,25 +397,31 @@ def _add_phase_bands(ax, elapsed, phases, alpha=0.07):
         ax.axvspan(x0, x1, alpha=alpha, color=color, linewidth=0)
 
 
-def _add_event_vlines(ax, elapsed, events, color="red", alpha=0.7, label_prefix=""):
-    """在时间轴上标注事件竖线。"""
-    seen: set[str] = set()
-    for t, ev in zip(elapsed, events):
-        if not ev:
-            continue
-        if t not in seen:
-            seen.add(t)
-            ax.axvline(x=t, color=color, alpha=alpha, linewidth=1.2, linestyle="--")
-            ax.text(t, ax.get_ylim()[1] * 0.95, label_prefix + ev,
-                    fontsize=6, rotation=90, ha="right", va="top", color=color, alpha=0.8)
-
-
 def _save_fig(fig, path: Path, title: str):
     fig.suptitle(title, fontsize=11, y=0.98)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  -> saved: {path.name}")
+
+
+def remove_legacy_plots(plots_dir: Path):
+    """Remove retired plots and preserve TPS under the compact 01/02/03 layout."""
+    for name in LEGACY_PLOT_NAMES:
+        path = plots_dir / name
+        if path.exists():
+            path.unlink()
+            print(f"  -> removed legacy plot: {name}")
+
+    old_tps = plots_dir / LEGACY_TPS_PLOT_NAME
+    new_tps = plots_dir / TPS_PLOT_NAME
+    if old_tps.exists():
+        if new_tps.exists():
+            old_tps.unlink()
+            print(f"  -> removed duplicate legacy plot: {LEGACY_TPS_PLOT_NAME}")
+        else:
+            old_tps.rename(new_tps)
+            print(f"  -> renamed legacy plot: {LEGACY_TPS_PLOT_NAME} -> {TPS_PLOT_NAME}")
 
 
 # --------------------------------------------------------------------------- #
@@ -522,211 +531,11 @@ def plot_cpu_ram(monitor: dict, plots_dir: Path):
 
 
 # --------------------------------------------------------------------------- #
-# 图3：训练 Loss 曲线
-# --------------------------------------------------------------------------- #
-def plot_training_loss(trainer_logs: dict, plots_dir: Path):
-    if not _HAS_MPL:
-        return
-    fig, ax = plt.subplots(figsize=(12, 5))
-    has_data = False
-    for phase, data in sorted(trainer_logs.items()):
-        if data["steps"] and data["loss"]:
-            color = PHASE_COLORS.get(phase, "#888888")
-            ax.plot(data["steps"], data["loss"], label=phase, color=color, linewidth=1.5, marker=".", markersize=3)
-            has_data = True
-    if not has_data:
-        ax.text(0.5, 0.5, "No loss data found\n(training may not have run, or log format not matched)",
-                ha="center", va="center", transform=ax.transAxes, fontsize=11)
-    ax.set_ylabel("Loss")
-    ax.set_xlabel("Training Step")
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-    ax.set_yscale("log")
-
-    _save_fig(fig, plots_dir / "03_training_loss.png",
-              "Training Loss Curve (per Phase)\n(log scale)")
-
-
-# --------------------------------------------------------------------------- #
-# 图4：梯度范数曲线
-# --------------------------------------------------------------------------- #
-def plot_grad_norm(trainer_logs: dict, plots_dir: Path):
-    if not _HAS_MPL:
-        return
-    fig, ax = plt.subplots(figsize=(12, 5))
-    has_data = False
-    for phase, data in sorted(trainer_logs.items()):
-        gn = [g for g in data.get("grad_norm", []) if g == g]  # 过滤 NaN
-        if data["steps"] and gn:
-            steps = data["steps"][:len(gn)]
-            color = PHASE_COLORS.get(phase, "#888888")
-            ax.plot(steps, gn, label=phase, color=color, linewidth=1.5, marker=".", markersize=3)
-            has_data = True
-    if not has_data:
-        ax.text(0.5, 0.5, "No grad_norm data found",
-                ha="center", va="center", transform=ax.transAxes, fontsize=11)
-    ax.set_ylabel("Gradient Norm")
-    ax.set_xlabel("Training Step")
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-
-    # P1 diagnostic annotation
-    ax.text(0.02, 0.97,
-            "P1 check: if phase2b(accum=4) norm ~= phase2a(accum=1) / 4  =>  grad overwrite bug confirmed",
-            transform=ax.transAxes, fontsize=7, va="top", style="italic", color="#666666")
-
-    _save_fig(fig, plots_dir / "04_grad_norm.png",
-              "Gradient Norm Curve (per Phase)\n(P1: compare phase2a vs phase2b to detect grad overwrite bug)")
-
-
-# --------------------------------------------------------------------------- #
-# 图5：NaN/Inf/崩溃事件时间线
-# --------------------------------------------------------------------------- #
-def plot_nan_timeline(trainer_logs: dict, exit_codes: dict, plots_dir: Path):
-    if not _HAS_MPL:
-        return
-    fig, ax = plt.subplots(figsize=(12, 4))
-
-    phases = sorted(trainer_logs.keys())
-    y_labels = []
-    has_event = False
-
-    for yi, phase in enumerate(phases):
-        data = trainer_logs[phase]
-        nan_lines = data.get("nan_lines", [])
-        ec = exit_codes.get(phase, None)
-
-        color = PHASE_COLORS.get(phase, "#888888")
-        # 画基线
-        ax.hlines(yi, 0, max(data.get("steps", [1]) or [1]),
-                  colors=color, linewidth=2, alpha=0.5)
-
-        # NaN 事件（用行号当 x）
-        if nan_lines:
-            ax.scatter(nan_lines, [yi] * len(nan_lines),
-                       marker="x", color="red", s=60, zorder=5,
-                       label=f"{phase}: NaN/Inf" if not has_event else "")
-            has_event = True
-
-        # 崩溃标记
-        if ec is not None and ec != 0:
-            max_step = max(data.get("steps", [10]) or [10])
-            ax.scatter([max_step], [yi], marker="*", color="darkred", s=120, zorder=6)
-
-        y_labels.append(f"{phase} (ec={ec})" if ec is not None else phase)
-
-    ax.set_yticks(range(len(phases)))
-    ax.set_yticklabels(y_labels, fontsize=9)
-    ax.set_xlabel("Step / Log Line Number")
-    ax.set_title("NaN/Inf Locations (red x) & Crashes (red star)")
-    ax.grid(True, alpha=0.3, axis="x")
-
-    if not has_event:
-        ax.text(0.5, 0.5, "No NaN/Inf events detected (numerically stable)",
-                ha="center", va="center", transform=ax.transAxes,
-                fontsize=11, color="green")
-
-    _save_fig(fig, plots_dir / "05_nan_inf_timeline.png",
-              "NaN/Inf/Crash Event Timeline\n(P5: C++ grad index bug | P6: Router grad explosion)")
-
-
-# --------------------------------------------------------------------------- #
-# 图6：各 Phase 性能对比
-# --------------------------------------------------------------------------- #
-def plot_phase_summary(monitor: dict, trainer_logs: dict, exit_codes: dict, plots_dir: Path):
-    if not _HAS_MPL:
-        return
-
-    phases = ["phase1", "phase2a", "phase2b", "phase4", "phase5_p9", "phase5_p8"]
-    # 收集指标
-    peak_gpu_mem = {}
-    peak_ram_gb = {}
-
-    elapsed = monitor.get("elapsed", [])
-    phase_list = monitor.get("phase", [])
-    gpus = monitor.get("gpus", {})
-    ram_used = monitor.get("ram_plot_gb") or monitor.get("ram_used_gb", [])
-
-    for ph in phases:
-        indices = [i for i, p in enumerate(phase_list) if p == ph]
-        if not indices or not gpus:
-            peak_gpu_mem[ph] = 0
-        else:
-            peak_gpu_mem[ph] = max(
-                max(
-                    (gdata.get("plot_mem") or gdata["mem_used"])[i]
-                    for i in indices
-                    if i < len(gdata.get("plot_mem") or gdata["mem_used"])
-                )
-                for gi, gdata in gpus.items()
-            ) if gpus else 0
-
-        if indices and ram_used:
-            peak_ram_gb[ph] = max(ram_used[i] for i in indices if i < len(ram_used))
-        else:
-            peak_ram_gb[ph] = 0
-
-    # 每步样本数
-    step_counts = {ph: len(trainer_logs.get(ph, {}).get("steps", [])) for ph in phases}
-    avg_loss = {}
-    for ph in phases:
-        losses = [l for l in trainer_logs.get(ph, {}).get("loss", []) if l == l and l > 0]
-        avg_loss[ph] = sum(losses) / len(losses) if losses else 0
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
-    x = range(len(phases))
-    bar_colors = [PHASE_COLORS.get(p, "#888888") for p in phases]
-
-    def _bar(ax, vals, title, ylabel, note=""):
-        bars = ax.bar(phases, vals, color=bar_colors, alpha=0.8, edgecolor="white")
-        ax.set_title(title, fontsize=9)
-        ax.set_ylabel(ylabel, fontsize=8)
-        ax.tick_params(axis="x", labelsize=7)
-        ax.grid(True, alpha=0.3, axis="y")
-        for bar, v in zip(bars, vals):
-            if v > 0:
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                        f"{v:.1f}", ha="center", va="bottom", fontsize=7)
-        if note:
-            ax.text(0.01, 0.99, note, transform=ax.transAxes, fontsize=6,
-                    va="top", style="italic", color="#555555")
-
-    _bar(axes[0, 0], [peak_gpu_mem.get(p, 0) for p in phases],
-         "Peak GPU VRAM (GB)", "GB",
-         "Expert BF16 buffers reside on CPU\nGPU holds attention/embedding/norm only")
-
-    _bar(axes[0, 1], [peak_ram_gb.get(p, 0) for p in phases],
-         "Peak CPU RAM (GB)", "GB",
-         "MoE expert weights/grads/optimizer on CPU")
-
-    _bar(axes[1, 0], [step_counts.get(p, 0) for p in phases],
-         "Steps Completed", "steps",
-         "steps < expected => crash / DDP timeout")
-
-    _bar(axes[1, 1], [avg_loss.get(p, 0) for p in phases],
-         "Mean Loss", "Loss",
-         "phase1-2 only 3-8 steps; high loss is expected")
-
-    # Exit code annotation
-    for i, ph in enumerate(phases):
-        ec = exit_codes.get(ph)
-        if ec is not None and ec != 0:
-            for ax_row in axes:
-                for ax in ax_row:
-                    bars = ax.containers
-                    ax.text(i, 0, f"ec={ec}", ha="center", va="bottom",
-                            fontsize=6, color="red", fontweight="bold")
-
-    _save_fig(fig, plots_dir / "06_phase_summary.png",
-              "Phase Performance Summary\n(Peak VRAM | Peak RAM | Steps Completed | Mean Loss)")
-
-
-# --------------------------------------------------------------------------- #
-# 图7：逐步 TPS 曲线
+# 图3：逐步 TPS 曲线
 # --------------------------------------------------------------------------- #
 def plot_tps(tps_data: dict, plots_dir: Path):
     if not _HAS_MPL or not tps_data:
-        print("  -> no TPS data (tqdm step times not found), skipping plot 7")
+        print("  -> no TPS data (tqdm step times not found), skipping plot 3")
         return
 
     fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
@@ -795,7 +604,7 @@ def plot_tps(tps_data: dict, plots_dir: Path):
             )
 
     _save_fig(
-        fig, plots_dir / "07_tps.png",
+        fig, plots_dir / TPS_PLOT_NAME,
         "Training Throughput (TPS)\n"
         f"TPS = num_gpus × cutoff_len × batch × accum / step_time  "
         f"(warmup skip={WARMUP_SKIP} for phase4 avg)",
@@ -1007,7 +816,7 @@ def generate_summary_md(
     if p5_results:
         p5_result = "⚠ " + p5_result
     lines.append(f"| P5 | C++ 梯度索引 bug / NaN | {p5_result} |")
-    lines.append("| P6 | Router 梯度稳定性 | 见 `plots/04_grad_norm.png`（full 模式 Router 参与梯度） |")
+    lines.append("| P6 | Router 梯度稳定性 | 由训练日志中的 grad_norm 数值检查（full 模式 Router 参与梯度） |")
 
     p7_count = 0
     if p4_log.exists():
@@ -1150,11 +959,7 @@ def generate_summary_md(
         "|------|------|",
         "| `plots/01_gpu_memory.png` | GPU 显存占用 & SM 利用率时序（优先进程树） |",
         "| `plots/02_cpu_ram.png` | CPU RAM & CPU 利用率时序（优先进程树 RSS） |",
-        "| `plots/03_training_loss.png` | 训练 Loss 曲线（各 Phase） |",
-        "| `plots/04_grad_norm.png` | 梯度范数曲线（含 P1 诊断说明） |",
-        "| `plots/05_nan_inf_timeline.png` | NaN/Inf/崩溃事件时间线 |",
-        "| `plots/06_phase_summary.png` | 各 Phase 性能对比 |",
-        "| `plots/07_tps.png` | 逐步 TPS 曲线（phase4 稳定吞吐 + warmup 标注） |",
+        "| `plots/03_tps.png` | 逐步 TPS 曲线（phase4 稳定吞吐 + warmup 标注） |",
         "",
         "---",
         "",
@@ -1186,6 +991,7 @@ def main():
 
     plots_dir = log_dir / "plots"
     plots_dir.mkdir(exist_ok=True)
+    remove_legacy_plots(plots_dir)
 
     print(f"[analyze] log_dir : {log_dir}")
     print(f"[analyze] plots_dir: {plots_dir}")
@@ -1216,19 +1022,7 @@ def main():
         print("[analyze] plot 2: CPU RAM ...")
         plot_cpu_ram(monitor, plots_dir)
 
-        print("[analyze] plot 3: training loss ...")
-        plot_training_loss(trainer_logs, plots_dir)
-
-        print("[analyze] plot 4: grad norm ...")
-        plot_grad_norm(trainer_logs, plots_dir)
-
-        print("[analyze] plot 5: NaN/Inf timeline ...")
-        plot_nan_timeline(trainer_logs, exit_codes, plots_dir)
-
-        print("[analyze] plot 6: phase summary ...")
-        plot_phase_summary(monitor, trainer_logs, exit_codes, plots_dir)
-
-        print("[analyze] plot 7: TPS ...")
+        print("[analyze] plot 3: TPS ...")
         plot_tps(tps_data, plots_dir)
     else:
         print("[analyze] matplotlib not installed, skipping plots")

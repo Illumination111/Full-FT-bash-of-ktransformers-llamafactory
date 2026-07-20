@@ -1295,7 +1295,7 @@ PYEOF
         echo ""
         echo "- GPU 显存: \`${LOG_DIR}/plots/01_gpu_memory.png\`"
         echo "- CPU 内存: \`${LOG_DIR}/plots/02_cpu_ram.png\`"
-        echo "- TPS: \`${LOG_DIR}/plots/07_tps.png\`"
+        echo "- TPS: \`${LOG_DIR}/plots/03_tps.png\`"
     } > "${summary}"
 
     log "Summary: ${summary}"
