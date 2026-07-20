@@ -423,3 +423,22 @@ kt-kernel/operators/amx/sft_moe.hpp:1949  AMX BF16 optimized branch
 kt-kernel/operators/amx/sft_moe.hpp:2001  Down strip
 kt-kernel/operators/amx/sft_moe.hpp:2052  Gate/Up strip
 ```
+
+## 10. FFTtest 可视化 working-tree 变更
+
+2026-07-20 的可视化精简发生在独立仓库 `/mnt/data2/wbw/FFTtest`，不改变 `/mnt/data2/wbw/ktransformers` 代码树。比较基线为：
+
+```text
+仓库          /mnt/data2/wbw/FFTtest
+分支          agent/add-expert-gradient-probe
+HEAD/base     d76dc2bc386e15e289480b235e19b580df2eb50b
+提交范围      本节列出的可视化变更
+```
+
+本轮相关 tracked diff 为 4 个测试/分析脚本、`39 insertions / 245 deletions`：
+
+- `Qwen3-30B-A3B/analyze.py` 删除 Loss、grad norm、NaN/Inf 和 phase summary 四组绘图函数，只保留 GPU 显存、CPU 内存与 TPS；TPS 从 `07_tps.png` 重编号为 `03_tps.png`，分析旧目录时会清理旧图名；
+- `run_finetune_perf_test_bf16.sh` 与 `run_finetune_perf_test_bf16_deepspeed.sh` 的摘要链接同步指向 `03_tps.png`；
+- `run_full_ft_test_1gpu_bf16_frozen.sh` 不再引用已移除的 `04_grad_norm.png`，Router 稳定性改为引用训练日志中的数值检查。
+
+`test_log/` 被 `.gitignore` 排除，因此历史图片的删除与 `07_tps.png -> 03_tps.png` 重命名不会出现在 tracked Git diff 中。进入本轮前，`AGENTS.md` 和多份 AMX 文档已经存在其他未提交修改；本轮保留这些修改，没有将其误记为上述 4 个脚本的可视化 diff。

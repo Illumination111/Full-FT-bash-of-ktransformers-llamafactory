@@ -1458,7 +1458,7 @@ PYEOF
             fi
         done
         echo "| P5 | C++ 梯度索引 bug / NaN | ${p5_status} |"
-        echo "| P6 | Router 梯度稳定性 | 见 plots/04_grad_norm.png |"
+        echo "| P6 | Router 梯度稳定性 | 由训练日志中的 grad_norm 数值检查 |"
         echo "| P7 | update_base_weights 开销 | 见 phase4_analysis.txt / step_timing |"
 
         if [[ "${GDB_MODE}" -eq 1 ]]; then
