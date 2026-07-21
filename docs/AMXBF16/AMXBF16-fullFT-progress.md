@@ -3,6 +3,8 @@
 > 代码基准：KTransformers PR [#2086](https://github.com/kvcache-ai/ktransformers/pull/2086)，head [`1e95053`](https://github.com/kvcache-ai/ktransformers/commit/1e95053b15b32e6db8193fd852d62d051c6e7ef5)，核对时间 2026-07-17。
 >
 > 本文只描述该 commit 上的代码事实。PR 当前仍为 Open，GitHub 判定可合并但状态为 `UNSTABLE`，且当前 head 没有 CI status check；因此“结构链路已接通”不等于“该 head 已完成端到端验收”。
+>
+> 本地同步阶段已完成：`fullft-development`、`origin/fullft-development` 与 `upstream/pr-2086` 均指向 `1e95053`，KTransformers tracked working tree clean。同步前的 6 个 tracked 修改和 2 个未跟踪 timing 文件完整保存在 `stash@{0}`，不属于当前工作树。本轮按要求只同步代码并更新文档，没有对该 head 运行新的测试或 benchmark。
 
 ## 当前结论
 
@@ -17,6 +19,199 @@ PR #2086 已经在代码结构上接通 AMX BF16 CPU MoE 专家基础权重的 F
 7. C++/Python 已加入分阶段 profiler，可分别观察 forward、backward、dWeight、base-weight reload 和 backward repack。
 
 当前仍不能宣称功能已经完整验收：最新 dWeight 和 direct BF16 reload 提交只有聚焦测试源码与 profiler 测试，PR head 没有 CI 结果，也没有保留一份针对 `1e95053` 的完整 Full-FT reference、15-step 模式回归和 TPS 报告。
+
+## 全量微调本身的数据流：GPU 主干与 CPU AMX 专家协同
+
+### “全量”指参数都参与训练，不是所有计算都搬到 CPU
+
+在这条 Full-FT 路径中，模型仍然是一张连续的 PyTorch Autograd 计算图，但不同部分放在不同硬件上执行：
+
+- embedding、attention、RMSNorm、LM head、router/gate 等普通模型模块仍由 GPU 执行；它们的参数、激活、梯度和 optimizer state 通常位于 GPU 显存；
+- 被 KTransformers 替换的 routed expert 基础权重放在 CPU 内存，并作为 CPU BF16 `nn.Parameter` 参加同一个 optimizer；
+- expert 的 Gate、Up、Down 大矩阵乘由 CPU 核心上的 AMX 执行，路由重排、SiLU、逐元素乘、NUMA 合并等辅助工作由 CPU 执行；
+- 一次 MoE 层调用需要把 GPU 产生的 hidden state 和路由结果送到 CPU，再把 CPU expert 输出送回 GPU；backward 以相反方向交换上游梯度、`dX` 和 router 梯度；
+- optimizer 最终同时更新 GPU 上的普通模型参数和 CPU 上的 expert 参数。因此这里的“全量微调”描述的是训练参数覆盖范围，而不是要求所有参数驻留在同一个设备。
+
+本文中的 **router** 是在 token 与 expert 之间做 top-k 选择的网络（部分模型源码也把它命名为 `gate`）；**Gate projection** 则是每个 expert 内部与 Up、Down 并列的三组权重之一。两者位置、输入输出和梯度路径都不同。
+
+在 LlamaFactory 的 full 模式没有额外冻结配置时，逻辑上的参数更新关系是：
+
+```text
+GPU 参数：embedding / attention / norm / router / LM head / GPU-side 分支 ...
+   ▲                         同一 loss / 同一 Autograd 图
+   │
+   └──────────────┬───────────────────────────────────────────────┐
+                  │                                               │
+CPU 参数：routed expert 的 Gate / Up / Down BF16 基础权重          │
+                  ▲                                               │
+                  └────────────── 同一个训练 step 的 optimizer ────┘
+```
+
+这里还要区分 CPU、AMX 和内存三个概念。AMX 不是一块带有独立显存的加速卡，而是 CPU 核心内部的矩阵执行单元和 tile 寄存器。权重、激活和梯度长期驻留的是 CPU DRAM 或 cache；worker 运行 kernel 时才把当前 panel 装入 AMX tile，累加后写回 CPU buffer。所谓“提高 tile 常驻和复用”是让一个 kernel/任务的内层计算尽量复用已经装入 tile 的数据，不表示整层权重能跨 kernel 或跨训练 step 永久留在 AMX 寄存器中。
+
+### 各硬件和内存区域分别保存什么
+
+| 位置 | 主要常驻对象 | 在训练中的职责 |
+| --- | --- | --- |
+| GPU 显存 | 非 expert 参数、router 参数、GPU optimizer state、当前层 hidden state、router logits/top-k 结果、GPU Autograd 激活和梯度 | 执行模型主干、router 和可选 shared/LoRA expert；承接 CPU expert 前后的 Autograd |
+| CPU 内存 | Gate/Up/Down 权威 BF16 Parameter、expert 梯度、CPU optimizer state、GPU↔CPU staging buffer、forward cache、AMX BufferA/BufferB/BufferC 和 scratch | 保存体积最大的 routed expert；完成路由重排、AMX 计算、梯度生成和 CPU 参数更新 |
+| CPU NUMA-local 内存/cache | 每个 NUMA 的 intermediate slice、对应 forward BufferB、worker scratch | 避免远端 socket 反复读大权重；并行计算各自的 `I` 维分片 |
+| AMX tile 寄存器 | 当前微内核处理的 activation/weight tile 和 FP32 accumulator | 在一个任务的 K reduction 内高吞吐完成 BF16 矩阵乘；任务结束后结果回写 CPU 内存 |
+
+CPU 内存中的对象还分成两类，不能把它们看成同一份权重：
+
+1. **权威训练状态**：CPU BF16 Parameter、`.grad` 以及 optimizer 的一阶/二阶状态。checkpoint 保存的是这类 Parameter；optimizer 只更新权威 Parameter。
+2. **计算派生状态**：面向 AMX 访问顺序的 forward BufferB、其转置方向的 backward BufferB，以及每个 batch 的 BufferA、forward cache 和临时结果。这些对象服务于计算，不是新的可训练 Parameter。
+
+### 一次 forward：数据从 GPU 主干进入 CPU expert，再回到 GPU
+
+设当前 MoE 层共有 `T = batch_size × sequence_length` 个 token，每个 token 选择 `K` 个 expert，hidden size 为 `H`，expert intermediate size 为 `I`。单卡主路径如下：
+
+```text
+DataLoader/CPU batch
+        │  token id 等输入送入 GPU
+        ▼
+GPU：Embedding → Attention/Norm → hidden state [T,H]
+        │
+        ├─ GPU router：logits → top-k expert id [T,K]
+        │                       top-k weight [T,K]
+        │
+        ├──────── hidden/id/weight：GPU → CPU staging buffer ────────┐
+        │                                                           ▼
+        │       CPU：token-major → expert-major dispatch，得到约 T×K 条 routed row
+        │                                                           │
+        │                              ┌─ AMX Gate：G = X Wg^T ─────┤
+        │                              └─ AMX Up：  U = X Wu^T ─────┤
+        │                                                           ▼
+        │                         CPU：Z = SiLU(G) ⊙ U
+        │                                                           │
+        │                              AMX Down：Y = Z Wd^T          │
+        │                                                           ▼
+        │                  CPU：乘 routing weight、按原 token 合并
+        │                                                           │
+        ├── 可并行：GPU shared expert / GPU LoRA expert              │
+        │                                                           │
+        ◀────────────── routed expert output [T,H]：CPU → GPU ──────┘
+        │
+        ▼
+GPU：CPU routed 输出 + 可选 GPU-side expert 输出 → residual/下一层
+```
+
+该流程中 Gate、Up、Down 的作用分别是：
+
+- **Gate**：把 `X:[*,H]` 投影到 `I` 维并经过 SiLU，形成每个 intermediate channel 的门控幅度；
+- **Up**：把同一个 `X` 投影到 `I` 维，提供被门控的内容；
+- **逐元素融合**：`Z = SiLU(G) ⊙ U`，只有这里把 Gate 与 Up 两条支路合在一起；
+- **Down**：把 `Z:[*,I]` 投影回 `H` 维，使 expert 输出能够回到 Transformer residual stream。
+
+CPU 不会对所有 expert、所有 token 做稠密计算。router 在 GPU 上先给出 top-k，CPU 再按 expert 重新排列约 `T×K` 条 routed row；每个 expert 只消费分到自己的 token。重排后的连续布局使相同 expert 的权重 panel 能被连续任务复用，也使 Gate/Up 可以共享同一批输入 `X`。
+
+当前训练实现的 GPU→CPU staging 是显式边界：hidden state 转成 BF16、expert id 转成 INT64、routing weight 转成 FP32 后写入普通 CPU buffer，代码还会在提交 CPU 任务前同步相应 CUDA device。`submit_forward()` 随后异步派发 CPU expert；如果模型配置了 GPU-side shared expert 或独立 LoRA expert，GPU 可以在这段时间计算这些分支，最后在 `sync_forward()` 处等待 routed expert 并相加。没有可并行 GPU 分支时，GPU 主干仍必须等待 CPU expert 输出，不能仅凭“异步 submit”认为整段 CPU 时间都被隐藏。
+
+### expert forward cache 与 gradient checkpoint 的数据代价
+
+普通训练为了 backward，会在 CPU 保存 expert-major 的 `X`、Gate/Up 输出、`Z`、Down 输出及路由 offset。其规模跟实际 routed row 数而不是原 token 数成正比；top-k 为 `K` 时，主要中间激活约按 `T×K` 扩张。
+
+启用当前非重入 gradient checkpoint 时，第一次 forward 不保留这组大 cache。backward 到达该层后，PyTorch 先在 GPU 重算这一 decoder layer，router 和 CPU expert forward 也会再次执行，然后 CPU cache 才供 expert backward 使用。因此 checkpoint 的交换是：
+
+```text
+减少长期保存的 GPU/CPU activation
+                 ↕
+增加一次 forward 计算，以及一次 hidden/id/weight 的 GPU→CPU 和 output 的 CPU→GPU 流动
+```
+
+这也解释了日志中 `checkpoint 重算` 为什么能与 `base-weight dW` 同为 backward 主耗时：它不是一个只恢复指针的轻量操作，而是重复了真实 forward 数据流。
+
+### 一次 backward：上游梯度进入 CPU，dX、router 梯度回到 GPU
+
+forward 输出回到 GPU 后，loss 仍在 GPU 上形成。GPU Autograd 反向走到 KT MoE 节点时，数据按以下方向流动：
+
+```text
+GPU：来自后续层的 dO [T,H]
+        │
+        └────────────── dO：GPU → CPU grad_output buffer
+                                      │
+                                      ▼
+CPU：按 forward 路由展开 dY_e = routing_weight_e × dO
+      │
+      ├─ router selected-weight grad = <expert_output_e, dO>
+      │
+      ├─ AMX Down dX：        dZ = dY Wd
+      │
+      ├─ CPU 激活反向：       dG、dU
+      │
+      ├─ AMX Gate/Up dX：     dX_e = dG Wg + dU Wu
+      │
+      └─ AMX dWeight：        dWg = dG^T X
+                              dWu = dU^T X
+                              dWd = dY^T Z
+        │
+        ├──────── dX [T,H]：CPU → GPU，继续 attention/前层 backward
+        ├──────── selected router grad [T,K]：CPU → GPU
+        │                               └─ GPU Autograd 继续经过 top-k weight/router
+        └──────── dWg/dWu/dWd：留在 CPU，连接到 CPU expert Parameter.grad
+```
+
+这里有两类完全不同的梯度流：
+
+- `dX` 和 selected routing-weight gradient 必须回到 GPU，因为它们是 GPU 计算图上游节点的输入；
+- `dW_gate`、`dW_up`、`dW_down` 不需要在单卡场景往返 GPU。C++ 直接写 CPU BF16 gradient buffer，自定义 Autograd Function 再把这些 buffer 返回到相应 CPU Parameter 的 `.grad`。
+
+backward BufferB 也是 CPU 内存内的布局变化，不是权重传到另一个设备。Down dX 需要 `Wd` 的反向方向，Gate/Up dX 需要 `Wg/Wu` 的反向方向，因此代码把 forward packed BufferB 转置 repack 到 backward BufferB。共享 backward BufferB 时，当前层结束后可提前为 backward 顺序的下一层提交 repack，并尝试与 GPU 上其他层的 attention backward 重叠；真正使用前仍必须等待它就绪。
+
+### NUMA 如何共同完成一个 expert
+
+在多 socket CPU 上，内存访问不是等价的。当前 TP/NUMA wrapper 沿 expert 的 `I` 维切分 Gate/Up 输出和 Down 输入，每个 NUMA node 使用本地 worker、BufferB 和 scratch 处理自己的 slice：
+
+```text
+同一个 routed X [*,H]
+   ├─ NUMA 0：Gate/Up 的 I0 slice → Z0 → Down partial Y0
+   ├─ NUMA 1：Gate/Up 的 I1 slice → Z1 → Down partial Y1
+   └─ ...
+
+Forward：Y = Y0 + Y1 + ...
+Backward：dX = dX0 + dX1 + ...，router partial grad 也需要合并
+dWeight：各 NUMA 直接写 [E,I,H] 或 [E,H,I] 中互不重叠的 I slice
+```
+
+因此 NUMA 间不可避免地要合并最终 `H` 维输出和 `dX`，但大体积权重读取、AMX pack 和 dWeight 写入应尽量停留在各自 node。optimizer 更新后 direct BF16 reload 也是从完整 CPU Parameter 中按 stride 读取每个 `I` slice，直接生成对应 NUMA 的 forward BufferB；它减少临时分片和 memcpy，但仍要读取全部新权重并完成一次 pack。
+
+### optimizer：两类设备上的参数在同一个 step 收敛到新版本
+
+backward 完成后，PyTorch 看到的是同一计算图中的混合设备参数：GPU 普通参数持有 GPU gradient，CPU expert Parameter 持有 CPU gradient。optimizer 按 Parameter 所在设备更新它们；expert 的 optimizer state 留在 CPU，GPU 参数的 optimizer state 留在 GPU。state 的精度、是否使用 fused kernel 等细节由实际 Trainer/optimizer 配置决定，不应从数据所在设备反推。
+
+一次参数更新及下一轮重新物化的顺序是：
+
+```text
+全部 backward 完成
+  ├─ 单卡：CPU expert dW 留在 CPU；GPU 参数梯度留在 GPU
+  └─ 多 rank：KT 管理梯度按分布式路径同步，CPU gradient 可能暂存到 GPU 做 all-reduce 再拷回
+        ↓
+grad clip / optimizer.step()
+  ├─ GPU：更新 attention/router/... 参数及其 optimizer state
+  └─ CPU：更新 Gate/Up/Down 权威 BF16 Parameter 及其 optimizer state
+        ↓
+把 expert base weight 标记为 dirty
+        ↓
+下一轮该 MoE 层 forward 入口
+  └─ CPU 权威 BF16 Parameter → direct pack → 各 NUMA forward BufferB
+```
+
+optimizer 更新的是 row-major 权威 Parameter，而 AMX forward 读取的是 BufferB，所以二者之间必须有 dirty/reload 边界。BF16 direct reload 消除的是中间 TP 临时分片，不会消除“读取更新后的 Gate/Up/Down，并重新生成 AMX 布局”本身。只要权重每个 step 都改变，这段 CPU 内存流量就仍然存在。
+
+### 每层真正跨设备和不跨设备的数据
+
+| 阶段 | 数据 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| forward 输入 | hidden `[T,H]`、id `[T,K]`、weight `[T,K]` | GPU → CPU | routed expert 的固定边界；当前代码在 CPU submit 前有 CUDA 同步 |
+| forward 输出 | merged expert output `[T,H]` | CPU → GPU | 回到 residual stream，并与可选 GPU-side expert 输出相加 |
+| backward 输入 | `dO [T,H]` | GPU → CPU | CPU expert backward 的上游梯度 |
+| backward 输出 | `dX [T,H]`、selected router grad `[T,K]` | CPU → GPU | 继续 GPU 主干和 router 的 Autograd |
+| expert dWeight | 三组完整参数梯度 | CPU 内部 | 单卡不需要经过 GPU；C++ buffer 直接接到 CPU Parameter.grad |
+| optimizer 后 reload | CPU Parameter → forward BufferB | CPU 内部 | 是布局物化，不是 CPU→GPU 传输，也不是数值 requant |
+| 多 rank 同步 | CPU expert grad → GPU all-reduce → CPU | CPU ↔ GPU/网络 | 只在分布式梯度同步路径发生，可能成为额外大流量 |
+
+所以这套 Full-FT 系统的关键并不是“CPU 代替 GPU 完成整个模型”，而是：GPU 保持 Transformer 主干和训练控制流，CPU 内存容纳 routed expert 的参数、梯度与 optimizer 状态，CPU worker 用 AMX 完成 expert 的三个主要 GEMM，两边通过每层 activation/gradient staging 接成一张 Autograd 图。性能上需要同时观察 GPU↔CPU staging、AMX Gate/Up/Down 与 dWeight、NUMA 合并、checkpoint 重算、optimizer CPU 内存带宽和每 step BufferB reload；只优化其中一个 kernel 不代表整条训练数据流已经没有瓶颈。
 
 ## 代码地图
 
