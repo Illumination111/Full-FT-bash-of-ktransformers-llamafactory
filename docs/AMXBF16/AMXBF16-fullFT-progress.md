@@ -20,6 +20,140 @@ PR #2086 已经在代码结构上接通 AMX BF16 CPU MoE 专家基础权重的 F
 
 当前仍不能宣称功能已经完整验收：最新 dWeight 和 direct BF16 reload 提交只有聚焦测试源码与 profiler 测试，PR head 没有 CI 结果，也没有保留一份针对 `1e95053` 的完整 Full-FT reference、15-step 模式回归和 TPS 报告。
 
+## Full-FT 与 LoRA 的 forward、训练耗时和 TPS 对比
+
+> 本节是 2026-07-21 对后续开发分支 `a3d1f15` 的补充核对，用于回答 Full-FT 与 LoRA 的性能口径问题；它不属于上文 `1e95053` 基准已经具备的代码事实。涉及 checkpoint forward 复用、authoritative optimizer gradient 和 direct Full-FT cache 等细节时，应以该后续实现为准。
+
+### 结论
+
+Full-FT 和 LoRA 会执行大体相同的 Transformer 主干与 routed expert 基础 forward，但两者不是同一条完整计算路径：
+
+- Full-FT 计算基础 expert，并让 router 和 Gate、Up、Down 基础权重参与训练；纯 Full 模式设置 `full_weight_grad=True`、`lora_rank=0`；
+- LoRA 仍然必须执行完整的冻结基础 expert，同时额外计算低秩增量；router 在当前 LoRA 路径中冻结；
+- 因此两者的纯 forward 时间可以很接近，但理论上不要求完全一致；
+- 如果 TPS 覆盖整个训练 step，即 forward、backward、梯度通信和 optimizer step，则更不应假定一致。通常 LoRA TPS 应高于 Full-FT，但当共同的 CPU expert、GPU attention、PCIe/NUMA 搬运或 checkpoint 重算占据关键路径时，两者也可能接近。
+
+### 两条 forward 路径的共同部分
+
+两种模式都要完成：
+
+1. GPU router 计算 top-k expert id 和 routing weight；
+2. hidden state、expert id 和 routing weight 提交到 KT CPU expert；
+3. CPU 执行基础 Gate、Up、Down expert 计算；
+4. 同步 CPU 输出，并与可选 GPU expert 输出合并；
+5. 训练时通过 `KTMoEFunction` 接入 backward。
+
+冻结基础权重只表示 optimizer 不更新它，不表示 forward 可以跳过它。用一个线性层表示，两种模式分别是：
+
+```text
+Full-FT: y = W x
+LoRA:    y = W x + scale × B(Ax)
+```
+
+对于 MoE expert，LoRA 增量分别附加在 Gate、Up、Down 投影上。因此 LoRA forward 相比 Full-FT 多出低秩 A/B GEMM；当 rank `r` 远小于 hidden size `H` 和 intermediate size `I` 时，这部分 FLOPs 通常远小于基础 expert GEMM，但仍有 kernel 调度和内存访问成本。
+
+### Full-FT forward 的特有工作
+
+当前实现中，Full-FT 有以下额外行为：
+
+- router 不处于 `torch.no_grad()` 中，top-k selected weight 的梯度可继续回到 router；
+- 自定义 Autograd 节点关联 `gate_proj_buf`、`up_proj_buf` 和 `down_proj_buf`；
+- optimizer 更新 CPU 基础权重后，下一次该层 forward 入口可能执行 `kt.sft.base_weight_reload`，重新生成 AMX forward BufferB；
+- AMX BF16 纯 Full 路径可以使用 `direct_fullft_cache`，减少部分 forward-cache 搬运和转换成本。
+
+因此不能只根据“Full 没有 LoRA A/B GEMM”推断它的实测 forward 一定更快；router 建图、base-weight reload 和不同 cache 路径也会影响墙钟时间。
+
+### LoRA forward 的特有工作
+
+LoRA 模式中基础 expert 权重冻结，但基础分支和低秩分支都要执行：
+
+```text
+Gate = Wg x + scale × Bg(Ag x)
+Up   = Wu x + scale × Bu(Au x)
+Z    = SiLU(Gate) ⊙ Up
+Out  = Wd Z + scale × Bd(Ad Z)
+```
+
+当前实现会在 LoRA 模式下用 `torch.no_grad()` 包裹 router，以避免为冻结 router 创建无用的 Autograd 节点；自定义 Autograd 节点改为关联 LoRA 参数。LoRA 参数更新后，KT 内核还需要读取更新后的 adapter buffer；指针为 dirty 时，forward 入口会刷新 LoRA pointers。
+
+### 为什么纯 forward 时间可能接近，但不应要求相等
+
+两种模式的大头通常都是共同的基础 MoE GEMM、GPU attention、CPU/GPU staging 和同步。LoRA rank 较小时，额外低秩计算可能只占很小比例；与此同时 Full-FT 又可能承担 router Autograd 和 base-weight reload。因此以下结果都可能合理：
+
+- LoRA 略慢：低秩 GEMM、adapter 内存访问和调度开销占优；
+- Full-FT 略慢：router 建图或 base-weight reload 占优；
+- 两者非常接近：共同的基础 expert 或跨设备搬运主导关键路径。
+
+所以，对只包含 model forward 的测量，可以预期“接近”，不能预期“严格相同”。比较时还必须把首次 warm-up、每 step 的 dirty weight reload、checkpoint 初次 forward 和 checkpoint recompute 分开，否则一个总的 `forward` 数字会混合不同工作。
+
+### 为什么完整训练 TPS 通常不一致
+
+训练 TPS 常见定义为 `有效训练 token 数 / 总训练墙钟时间`，其分母通常包含：
+
+```text
+forward + loss + backward + gradient communication
+        + optimizer.step + zero_grad + checkpoint recompute
+```
+
+两种模式都要计算 expert `dX`，因为梯度仍需传回前一层。主要区别在参数梯度和 optimizer：
+
+| 工作 | Full-FT | LoRA |
+| --- | --- | --- |
+| 基础 expert forward | 必须 | 必须 |
+| LoRA A/B forward | 无 | 有 |
+| expert `dX` | 必须 | 必须 |
+| router gradient | 有 | 当前路径冻结 |
+| 基础 `dW_gate/dW_up/dW_down` | 有 | 无 |
+| LoRA `dA/dB` | 无 | 有 |
+| optimizer 参数及 state | 完整基础权重规模 | 低秩参数规模 |
+| optimizer 后基础权重 reload | 有 | 无 |
+
+基础权重梯度规模为 `O(d_in × d_out)`，LoRA 参数梯度规模约为 `O(r × (d_in + d_out))`。Full-FT 还要更新完整 CPU expert 参数并读写相应 optimizer state，随后重新物化 AMX BufferB。因此在其他条件相同、且这些工作处于关键路径时，通常应有：
+
+```text
+LoRA training TPS > Full-FT training TPS
+```
+
+这不是无条件保证。以下因素会压缩差距：
+
+- CPU 基础 expert forward 或共同的 `dX` 是瓶颈；
+- GPU attention、PCIe/NUMA 数据搬运或多 rank 通信是瓶颈；
+- gradient checkpointing 使两种模式都重算大量 forward；
+- batch/sequence 太小，线程调度和同步占比高；
+- LoRA rank 较大、target modules 较多；
+- Full-FT 使用 direct cache、共享 backward BufferB 或 authoritative gradient 等优化；
+- TPS 统计没有覆盖 optimizer step，或两组实验的 padding、有效 token 数、路由分布不同。
+
+### 实验判断和 profiler 口径
+
+公平 A/B 必须保持模型、数据顺序、有效 token 数、micro-batch、GAS、序列长度、精度、checkpoint、CPU 线程、NUMA 绑定和分布式配置一致，并经过相同 warm-up。建议至少分别报告：
+
+```text
+纯 model forward TPS
+forward + backward TPS
+完整 train-step TPS（包含 optimizer）
+```
+
+同时对齐下列 profiler 区间：
+
+```text
+kt.sft.routing
+kt.sft.base_weight_reload
+kt.sft.submit_and_gpu_experts
+kt.sft.autograd_apply_and_cpu_sync
+kt.sft.checkpoint_recompute
+kt.sft.cpu_backward
+optimizer.step
+```
+
+结果可按以下原则解释：
+
+- 纯 forward 相差很小是合理现象；
+- 完整训练 TPS 中 LoRA 明显更高，符合通常预期；
+- 完整训练 TPS 接近，说明共同计算、通信或数据搬运更可能是瓶颈，不能据此认为两条路径相同；
+- Full-FT 明显快于 LoRA 时，应检查 LoRA rank、target modules、adapter 同步和 kernel profile；
+- 两边每 step 耗时几乎逐毫秒相同，应核实 Full 模式是否真正得到 `full_weight_grad=True, lora_rank=0`，以及 TPS 是否只统计了共同的 forward 区间。
+
 ## 全量微调本身的数据流：GPU 主干与 CPU AMX 专家协同
 
 ### “全量”指参数都参与训练，不是所有计算都搬到 CPU
