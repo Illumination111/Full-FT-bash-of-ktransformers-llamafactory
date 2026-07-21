@@ -65,6 +65,7 @@ PHASE4_STEPS=15
 TRAIN_BATCH_SIZE=1
 GRAD_ACCUM_STEPS=1
 LEARNING_RATE="1.0e-5"
+DS_PROBE_MODE="${DS_PROBE_MODE:-off}"
 
 # LoRA-only settings. `lora_target=all` is fixed so the FLOPs model matches the
 # actual adapter placement (all Linear modules except lm_head).
@@ -145,6 +146,10 @@ Roofline assumptions:
 Other:
   --dry-run                   Generate configs and print commands without training
   -h, --help                  Show this help
+
+Probe environment:
+  DS_PROBE_MODE=off|low_overhead|exact
+                              Nested DeepSpeed backward/optimizer probe (default: off)
 EOF
 }
 
@@ -191,6 +196,10 @@ done
 case "${FINETUNE_SELECTION}" in
     both|full|lora) ;;
     *) echo "Invalid --mode: ${FINETUNE_SELECTION} (expected both, full, or lora)" >&2; exit 1 ;;
+esac
+case "${DS_PROBE_MODE}" in
+    off|low_overhead|exact) ;;
+    *) echo "Invalid DS_PROBE_MODE: ${DS_PROBE_MODE} (expected off, low_overhead, or exact)" >&2; exit 1 ;;
 esac
 require_positive_int "--gpus" "${NUM_GPUS}"
 require_positive_int "--batch-size" "${TRAIN_BATCH_SIZE}"
@@ -375,6 +384,7 @@ estimate_resources() {
     echo "  Distribution : DeepSpeed ZeRO-3"
     echo "  CPU offload  : parameters + optimizer (pinned memory)"
     echo "  CPU optimizer: pre-installed DeepSpeedCPUAdam"
+    echo "  DS timing probe: ${DS_PROBE_MODE}"
     echo "  Weight source: ${MODEL_PATH}"
     echo ""
 
@@ -549,6 +559,7 @@ run_train() {
     log "Starting training [${phase_name}]: ${desc}"
     log "  DeepSpeed config  : $(basename "${DEEPSPEED_CONFIG}")"
     log "  GPUs              : ${NUM_GPUS}"
+    log "  DS timing probe   : ${DS_PROBE_MODE}"
     send_event "phase:${phase_name}"
     send_event "event:train_start"
 
@@ -566,6 +577,7 @@ run_train() {
         CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.8}"
         FFT_TRAINING_BACKEND=deepspeed
         KT_STEP_TIMING=1
+        DS_PROBE_MODE="${DS_PROBE_MODE}"
         KT_FINETUNE_MODE="${FT_MODE}"
         KT_STEP_TIMING_OUT_DIR="${timing_dir}"
         KT_STEP_TIMING_WARMUP_SKIP="${WARMUP_SKIP}"
@@ -994,7 +1006,11 @@ run_phase4() {
     log "Mode: ${FT_MODE}  |  steps: ${PHASE4_STEPS}  |  GPUs: ${NUM_GPUS}  |  batch: ${TRAIN_BATCH_SIZE}  |  cutoff_len: ${CUTOFF_LEN}  |  GAS: ${GRAD_ACCUM_STEPS}"
     log "TPS measurement: skipping first ${WARMUP_SKIP} warmup steps"
     log "tokens/optimizer-step = ${NUM_GPUS} × ${TRAIN_BATCH_SIZE} × ${CUTOFF_LEN} × ${GRAD_ACCUM_STEPS} = $((NUM_GPUS * TRAIN_BATCH_SIZE * CUTOFF_LEN * GRAD_ACCUM_STEPS))"
-    log "Performance-only run: extra probes and GDB are disabled"
+    if [[ "${DS_PROBE_MODE}" == "off" ]]; then
+        log "Performance-only run: nested DeepSpeed probe and GDB are disabled"
+    else
+        log "Nested DeepSpeed probe: ${DS_PROBE_MODE}; GDB is disabled"
+    fi
 
     local t_start
     t_start=$(date +%s)
@@ -1177,6 +1193,7 @@ generate_summary() {
         echo "**数据集**: ${DATASET_NAME}（100 条，样本 >7000 tokens，截断至 ${CUTOFF_LEN}）"
         echo "**Batch/GAS/学习率**: ${TRAIN_BATCH_SIZE} / ${GRAD_ACCUM_STEPS} / ${LEARNING_RATE}"
         echo "**性能步数**: ${PHASE4_STEPS}（前 ${WARMUP_SKIP} 步 warmup，后 $((PHASE4_STEPS - WARMUP_SKIP)) 步计算 TPS）"
+        echo "**DeepSpeed 探针/OMP**: ${DS_PROBE_MODE} / ${OMP_NUM_THREADS:-unrecorded}"
         echo ""
         echo "## 1. Phase 退出码"
         echo ""
@@ -1361,7 +1378,7 @@ generate_session_config() {
         "${TRAIN_BATCH_SIZE}" "${GRAD_ACCUM_STEPS}" "${CUTOFF_LEN}" \
         "${PHASE4_STEPS}" "${WARMUP_SKIP}" "${LEARNING_RATE}" \
         "${LORA_RANK}" "${LORA_ALPHA}" "$(basename "${DEEPSPEED_CONFIG}")" \
-        "${CONDA_ENV}" <<'PYEOF'
+        "${CONDA_ENV}" "${DS_PROBE_MODE}" "${OMP_NUM_THREADS:-unrecorded}" <<'PYEOF'
 import json
 import sys
 from pathlib import Path
@@ -1370,6 +1387,8 @@ out = Path(sys.argv[1]) / "session_config.json"
 obj = {
     "backend": "llamafactory_deepspeed_zero3_cpu_offload",
     "conda_environment": sys.argv[13],
+    "deepspeed_probe_mode": sys.argv[14],
+    "omp_num_threads": sys.argv[15],
     "selection": sys.argv[2],
     "execution_order": ["full", "lora"] if sys.argv[2] == "both" else [sys.argv[2]],
     "shared_training_parameters": {
@@ -1516,6 +1535,7 @@ main() {
     echo -e "Dataset: ${DATASET_NAME} @ ${DATA_DIR}  (every sample >7000 tokens)"
     echo -e "GPUs: ${NUM_GPUS}  |  batch: ${TRAIN_BATCH_SIZE}  |  cutoff_len: ${CUTOFF_LEN}  |  GAS: ${GRAD_ACCUM_STEPS}"
     echo -e "Steps: ${PHASE4_STEPS}  |  stable interval: $((WARMUP_SKIP + 1))-${PHASE4_STEPS}"
+    echo -e "DeepSpeed probe: ${DS_PROBE_MODE}  |  OMP_NUM_THREADS: ${OMP_NUM_THREADS:-unrecorded}"
     echo ""
 
     check_env

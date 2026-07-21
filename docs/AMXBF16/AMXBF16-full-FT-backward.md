@@ -1,27 +1,26 @@
-# AMX Full-FT Backward 代码设计与内部计时分析
+# AMX Full-FT Backward：当前实现、历史计时与后续分析边界
 
-## 1. 文档范围
+更新时间：2026-07-21
 
-本文分析 KTransformers 在 Qwen3-30B-A3B Full Fine-Tuning 中的 CPU/AMX MoE expert backward，重点覆盖：
+## 1. 文档范围与当前代码基线
 
-- `gate_proj`、`up_proj`、`down_proj` 基座权重的梯度计算；
-- expert activation 梯度如何沿 Down、激活函数、Gate/Up 向前一层传播；
-- gradient checkpoint、backward BufferB repack、NUMA 并行和梯度清零的作用；
-- 2026-07-16 内部打点运行的耗时分解；
-- 当前瓶颈、测量限制和后续优化顺序。
+本文分析 Qwen3-30B-A3B Full Fine-Tuning 中由 KTransformers CPU/AMX MoE experts 执行的 backward，覆盖 activation gradient、base-weight gradient、TP/NUMA merge、backward BufferB repack 和 staged profiling。
 
-主要测试日志：
+当前代码基线已经从历史的 `f209878` 更新为：
 
 ```text
-/mnt/data2/wbw/FFTtest/Qwen3-30B-A3B/test_log/
-  20260716_175359_1gpu_AMX_BF16_FULL
+ktransformers/fullft-development
+HEAD = 1e95053b15b32e6db8193fd852d62d051c6e7ef5
+PR   = kvcache-ai/ktransformers#2086
 ```
 
-测试配置为单卡、AMX BF16、2 NUMA、batch=1、GAS=1、序列长度 4096、15 steps、跳过前 5 个 warmup steps、OMP=96、PyTorch fused AdamW。内部计时模式为 `summary`，覆盖全部 48 层。
+本地 tracked 工作树与 GitHub PR head 一致。2026-07-16 的性能日志产生于 `f209878` 或其本地 timing 工作树，仍可作为历史热点证据，但不能替代 `1e95053` 的重新构建和训练验收。
 
-## 2. MoE MLP 的 forward 与 backward
+2026-07-20 新增了一次完整 Full-FT 内部打点运行，但运行时版本核验表明它仍不是 `1e95053`：`Kllama` 环境中的 `backward_timing.py` 和 `autograd.py` 与 `stash@{0}` 对应文件的 SHA-256 完全一致，C++ extension 也是 2026-07-16 构建。因此该运行是更新、更稳定的 **`f209878 + KT_BACKWARD_TIMING` 历史证据**，而不是 current head 验收。
 
-对一个 routed expert，忽略 batch 和路由维度后，forward 可写为：
+## 2. 数学目标
+
+单个 routed expert 的 forward：
 
 ```text
 G = X · Wgateᵀ
@@ -30,37 +29,16 @@ Z = SiLU(G) ⊙ U
 Y = Z · Wdownᵀ
 ```
 
-其中：
-
-- `X`：expert 输入，形状 `[M, H]`；
-- `G/U/Z`：expert 中间结果，形状 `[M, I]`；
-- `Y`：expert 输出，形状 `[M, H]`；
-- `M`：当前 expert 实际接收的 routed token 数；
-- `H=2048`：hidden size；
-- `I=768`：完整 intermediate size；2 NUMA/TP 下每个子核使用 `I_local=384`。
-
-Backward 分成两类数学目标。
-
-### 2.1 向前一层传播的 activation 梯度
+activation backward：
 
 ```text
 dZ = dY · Wdown
-
 dG = dZ ⊙ U ⊙ SiLU'(G)
 dU = dZ ⊙ SiLU(G)
-
 dX = dG · Wgate + dU · Wup
 ```
 
-这条路径对应日志中的：
-
-```text
-Down dX -> activation backward -> Gate/Up dX
-```
-
-最终的 `dX` 会继续传给上一层 Transformer、attention 和 normalization。缺少这条路径，autograd 会在 MoE 层中断。
-
-### 2.2 交给 optimizer 的基座权重梯度
+Full/Hybrid FT 的 base-weight gradient：
 
 ```text
 dWgate = dGᵀ · X
@@ -68,7 +46,7 @@ dWup   = dUᵀ · X
 dWdown = dYᵀ · Z
 ```
 
-输出布局为：
+完整梯度布局：
 
 ```text
 grad_gate_proj [experts, I, H]
@@ -76,479 +54,361 @@ grad_up_proj   [experts, I, H]
 grad_down_proj [experts, H, I]
 ```
 
-这条路径就是 `backward_base_weight_grad()`。它只在 Full/Hybrid FT 中执行；LoRA-only 的 `full_weight_grad=false`，不会计算基座 dW。
+Qwen3-30B-A3B 使用 `H=2048`、完整 `I=768`；2 NUMA/TP 时每个子核处理 `I_local=384`。LoRA-only 的 `full_weight_grad=false`，不会生成三组 base dW，但仍执行公共 base dX。
 
-## 3. Backward 的代码调用和执行顺序
-
-单层主要调用关系如下：
+## 3. 当前 backward 调用顺序
 
 ```text
 KTMoEFunction.backward()
 │
 ├─ wait_backward_repack()
-│    等待当前层 dX 所需的转置基座权重 BufferB
-│
 ├─ ctx.saved_tensors
-│    触发 non-reentrant checkpoint decoder-layer 重算
-│
-└─ wrapper.backward()
-     │
-     ├─ grad_output GPU/原设备 -> CPU buffer
-     ├─ 创建并提交 CPUInfer backward task
-     ├─ CPUInfer sync
-     │    │
-     │    └─ TP_MOE_SFT::backward()
-     │         ├─ 清零临时 buffer 和完整基座梯度
-     │         ├─ 两个 NUMA 子核并行 backward
-     │         │    ├─ restore routed input
-     │         │    ├─ backward_down_amx()
-     │         │    ├─ backward_activation()
-     │         │    ├─ backward_gate_up_amx()
-     │         │    ├─ router gradient
-     │         │    └─ backward_base_weight_grad()
-     │         ├─ 合并两个 NUMA 的 grad_input
-     │         ├─ 合并 router/LoRA partial gradients
-     │         └─ final NUMA barrier
-     │
-     └─ CPU gradients -> autograd 返回值
+│    └─ non-reentrant checkpoint 重算 decoder layer
+├─ wrapper.backward()
+│    ├─ grad_output -> CPU buffer
+│    ├─ CPUInfer submit/sync
+│    │    └─ TP_MOE_SFT::backward()
+│    │         ├─ buffer clear
+│    │         ├─ NUMA-local backward 并行
+│    │         │    ├─ cache restore
+│    │         │    ├─ Down base dX
+│    │         │    ├─ activation backward
+│    │         │    ├─ Gate/Up base dX
+│    │         │    ├─ router gradient
+│    │         │    └─ BF16 base dW
+│    │         └─ grad_input/LoRA/router merge
+│    └─ CPU gradients -> output device
+└─ submit next backward repack
 ```
 
-相关实现：
+主要实现：
 
-- [`KTMoEFunction.backward()`](../../ktransformers/kt-kernel/python/sft/autograd.py)
-- [`AMXSFTMoEWrapper.backward()`](../../ktransformers/kt-kernel/python/sft/base.py)
-- [`TP_MOE_SFT::backward()`](../../ktransformers/kt-kernel/operators/moe-sft-tp.hpp)
-- [`AMX_SFT_MOE_TP::backward()`](../../ktransformers/kt-kernel/operators/amx/sft_moe.hpp)
+- `kt-kernel/python/sft/autograd.py`
+- `kt-kernel/python/sft/base.py`
+- `kt-kernel/operators/moe-sft-tp.hpp`
+- `kt-kernel/operators/amx/sft_moe.hpp`
+- `kt-kernel/operators/amx/la/bf16_dweight.hpp`
 
-## 4. 各核心阶段的实际作用
+## 4. 关键阶段
 
-### 4.1 `checkpoint_recompute`
+### 4.1 Checkpoint recompute
 
-训练启用了 non-reentrant gradient checkpointing。第一次 forward 不永久保留全部 decoder-layer activation；进入 MoE backward 时，访问 `ctx.saved_tensors` 会触发 checkpoint unpack hook，重新执行该 decoder layer 的 forward。
+访问 `ctx.saved_tensors` 触发 non-reentrant checkpoint unpack hook，重新生成 expert 输入、路由、Gate/Up output、activation intermediate 和 C++ forward cache。它用计算换 activation 内存，不是可无条件删除的冗余。
 
-重算为 C++ backward 恢复：
+当前 Python 代码同时保留 `torch.profiler.record_function` 边界；C++ profiler 还区分 initial forward 与 recompute forward。
 
-- expert 输入 `X`；
-- router expert ID、position 和 routing weight；
-- Gate 输出 `G`；
-- Up 输出 `U`；
-- 激活后中间值 `Z`；
-- 其余 C++ forward cache。
+当前配置中，LLaMA-Factory 默认的 `disable_gradient_checkpointing=false` 会调用
+`model.gradient_checkpointing_enable(use_reentrant=false)`；FSDP2 也会把 reentrant 模式强制关闭。随后每个
+`Qwen3MoeDecoderLayer.__call__()` 都由 `torch.utils.checkpoint.checkpoint()` 包住整个 decoder layer。
 
-它不是梯度公式本身，而是典型的“内存换计算”：少保存 activation，代价是在 backward 中增加一次 forward-like 重算。
+开启 checkpoint 时，一个 layer 的生命周期如下：
 
-### 4.2 `Down dX`
+1. 初始 forward 仍执行 RMSNorm、attention、第二个 RMSNorm、router 和 KT MoE，但 non-reentrant checkpoint
+   的 saved-tensor hook 用 holder 代替这些算子原本要保存的内部 activation；主要只留下 layer 输入等重算入口。
+2. `KTMoELayerWrapper` 检测到 `first_forward` hook，把 C++ 提交参数改为
+   `save_for_backward=false`。CPU expert 会算出 forward output，但不保留 input、Gate/Up output、activation
+   intermediate 和 down output，避免所有 layer 同时持有大缓存。
+3. `KTMoEFunction.forward()` 保存一个标量 sentinel。该 sentinel 也被 checkpoint hook 接管。
+4. backward 逆序到该 MoE 时，`KTMoEFunction.backward()` 先访问 `ctx.saved_tensors`。解包 sentinel 会触发
+   整个 decoder layer 的重算；由于 sentinel 位于 MoE forward 内，重算至少会再次经过 attention、norm、router
+   和 KT MoE。
+5. 重算阶段 hook mode 不再是 `first_forward`，所以 KT 以 `save_for_backward=true` 再执行一次 CPU expert
+   forward，并填充 C++ backward cache。随后 `wrapper.backward()` 立即消费并 pop 这个 cache。
 
-`backward_down_amx()` 计算：
+这种严格的“重算一层、立刻反传一层”顺序使两个 NUMA 节点各自只需要一份跨 48 层共享的 cache pool；源码也明确
+标注 `share_cache_pool` 仅在 gradient checkpoint 下安全。
+
+关闭 checkpoint 后，decoder layer 不再经过 checkpoint wrapper，第一次 forward 就建立普通 PyTorch autograd
+图并保留 attention、RMSNorm、router 等 backward 所需 activation。`_checkpoint_hook_mode()` 返回 `none`，所以
+KT 第一次 CPU expert forward 直接使用 `save_for_backward=true` 并保存 C++ cache。backward 访问 sentinel 时不再
+触发重算，`kt.sft.checkpoint_recompute` 只剩近似空的取值开销，随后直接消费初始 forward 留下的 cache。
+
+因此完整关闭不能只删除 `ctx.saved_tensors` 或只跳过重算。正确的配置/生命周期组合是：
+
+- 训练配置设置 `disable_gradient_checkpointing: true`；
+- 保持训练 KV cache 关闭；LLaMA-Factory 当前会在 trainable 模式中自动设置 `config.use_cache=false`；
+- KT 必须使用每层独立 cache，即 `kt_share_cache_pool=false`。当前配置处理在 checkpoint 关闭时会回落到该值，但
+  仍应在启动日志中确认所有 layer 都打印 `share_cache_pool false`；若仍为 true，后层 forward 会覆盖前层 cache，
+  产生错误梯度而不只是内存不足；
+- 当前 benchmark 每层每个 step 只有一份未消费 cache，可把 `kt_max_cache_depth` 从 2 降为 1 来减半 cache
+  内存；必须用 cache stack 平衡检查及短训验证该假设。
+
+### 4.2 Down、activation、Gate/Up dX
+
+- Down：`dZ=dY·Wdown`，并保存稍后计算 `dWdown` 所需的 route-weighted `dY`；
+- activation：以缓存的 `G/U` 计算 `dG/dU`；
+- Gate/Up：`dX=dG·Wgate+dU·Wup`；
+- 两个 NUMA 计算各自 intermediate slice 对 `dX` 的贡献，顶层再合并为完整 `grad_input`。
+
+dX 的权重一侧可以使用提前准备的转置 base-weight BufferB，因此它与两个 operand 都是动态数据的 dW 有不同的数据复用条件。
+
+### 4.3 Buffer clear
+
+TP wrapper 在 NUMA 计算前清零临时 grad buffer、router/LoRA partial buffer 和完整 base-gradient tensor。约 28.991B CPU expert 参数对应约 54 GiB BF16 gradient。
+
+只有当前 step 确实覆盖完整目标区域时才能跳过或缩小清零。任何优化都必须覆盖 inactive expert、GAS、多 microbatch、TP slice 和跨 step 残留语义。
+
+### 4.4 Backward repack
+
+Forward 使用 `X·Wᵀ`，dX 使用 `dY·W`，因此需要不同的 BufferB 布局。`share_backward_bb=true` 时各层不永久保存整套 backward BufferB，而是在共享 pool 中异步准备下一层。
+
+`wait_backward_repack()` 只表示没有被前序工作隐藏的尾部等待，不是 base dW 动态 panel packing，也不同于 optimizer 后的 base-weight reload。
+
+## 5. 当前 BF16 dWeight 实现
+
+### 5.1 `f209878` 的历史原型
+
+旧原型在 `backward_base_weight_grad()` 内证明了三项方向：
+
+1. 任务从 `(expert, projection, i_tile, h_tile)` 合并为 fixed-`i_tile` strip；
+2. Gate/Up 或 Down 的固定动态 panel 在线程局部 scratch 中预打包和复用；
+3. FP32 C tile 跨完整 K reduction 常驻 AMX tile，最后只 store 一次。
+
+它把每层、每 NUMA 的理论任务量从：
 
 ```text
-dZ = dY · Wdown
+128 × 2 × 12 × 64 = 196,608
 ```
 
-实际工作包括：
-
-1. 根据路由把 token 级 `dY` 分发到对应 expert；
-2. 乘上 routing weight；
-3. 将动态 `dY` 转成 AMX `BufferA`；
-4. 使用预转置的 `down_backward_bb_` 作为 `BufferB`；
-5. AMX GEMM 生成 `grad_intermediate=dZ`；
-6. 保存一份不可变的 route-weighted `dY`，供稍后的 `dWdown=dYᵀ·Z` 使用。
-
-表格中的 “Down dX” 是 projection 术语；严格说它生成的是 Down projection 输入 `Z` 的梯度 `dZ`，不是整层最终的 `dX`。
-
-### 4.3 `activation_backward`
-
-该阶段根据 forward cache 中的 `G`、`U` 和 Down dX 得到的 `dZ`，计算：
+降到：
 
 ```text
-dG = dZ ⊙ U ⊙ SiLU'(G)
-dU = dZ ⊙ SiLU(G)
+128 × 2 × 12 = 3,072
 ```
 
-当前实现使用 AVX512，一次处理 32 个 BF16 元素，并为不足向量宽度的尾部保留标量路径。它在内部打点中单独记录，稳定合计约 47 ms/step。
+历史 Full/LoRA A/B 证明该方向有效，但该函数内手写实现不再是新 head 的完整描述。
 
-### 4.4 `Gate/Up dX`
+### 5.2 `1e95053` 的 current driver
 
-`backward_gate_up_amx()` 计算：
+今日 GitHub head 把 BF16 dW 抽为 `BF16DWeightKernel`，并复用 inference 的 `GemmKernel224BF16` driver：
+
+- 只为 active experts 创建任务；
+- Gate/Up 共用 input panel；
+- Down fixed-`i_tile` 复用 intermediate panel；
+- 线程局部 scratch 按需扩容并保持对齐；
+- 完整 K reduction 由通用 AMX/AVX512 driver 完成；
+- Gate/Up、Down、pack A、pack B、kernel 和 store 分别累计 timing；
+- 测试覆盖 reference、tail shape、Qwen shape 和 common-driver 性能门槛。
+
+当前 staged profiler 中：
 
 ```text
-dXgate = dG · Wgate
-dXup   = dU · Wup
-dX     = dXgate + dXup
+backward.base_weight_grad
+backward.base_weight_grad.offsets
+backward.base_weight_grad.matmat
+backward.base_weight_grad.worker_cpu.pack_a
+backward.base_weight_grad.worker_cpu.pack_b
+backward.base_weight_grad.worker_cpu.kernel_gate_up
+backward.base_weight_grad.worker_cpu.kernel_down
+backward.base_weight_grad.worker_cpu.store
 ```
 
-Gate/Up dX 使用已经预转置的 `gate_backward_bb_`、`up_backward_bb_`，因此权重一侧可以直接作为 AMX `BufferB`。两个 NUMA 分别计算本地 intermediate slice 对 `dX` 的贡献，顶层 TP wrapper 随后执行 BF16 -> FP32 相加 -> BF16 写回，合并成完整 `grad_input`。
+`worker_cpu.*` 是各 worker 的累计 CPU 时间，不是外层墙钟；不同 worker 并行执行时不能与 `backward.base_weight_grad` 直接相加或比较占比。
 
-### 4.5 `base-weight dW`
+## 6. Base-weight reload 的变化
 
-`backward_base_weight_grad()` 计算三组基座权重梯度：
+Optimizer 更新权威 CPU BF16 Parameter 后，下一次 forward 前仍需生成 AMX BufferB。新 head 可以从完整 Parameter 按 TP/NUMA stride 直接 pack，减少旧路径的临时分片分配和 memcpy，并分别记录：
 
 ```text
-dWgate = dGᵀ · X
-dWup   = dUᵀ · X
-dWdown = dYᵀ · Z
+weights.base_reload
+weights.base_reload.partition
+weights.base_reload.forward_pack
+weights.base_reload.direct_pack
+weights.base_reload.backward_pack
+weights.base_reload.cleanup
 ```
 
-与 dX 不同，dW 的两个 operand 都是当前 step 动态产生的数据，不能像基座权重 BufferB 一样跨 step 长期缓存。因此它需要在本次调用内完成动态 panel packing。
+Direct pack 没有消除完整 BufferB pack，也不能在新训练结果出现前宣称 requant/reload 已经被消除。
 
-Qwen3-30B-A3B 每 NUMA/TP 分区：
+## 7. 当前 profiler 口径
+
+`1e95053` 已提交的唯一 C++ timing 源是 `SFTProfiler`：
+
+- `KT_SFT_PROFILE=1` 必须在 MoE 对象创建前设置；
+- C++ 使用 `steady_clock` 和原子累计计数；
+- wrapper 与 `tp.<index>` scope 分别表示顶层和 NUMA-local 子核；
+- `get_profile_stats(reset=False)` 获取累计快照；
+- Python `collect_kt_sft_profile()` 聚合各层，`format_kt_sft_profile()` 输出表格；
+- PyTorch profiler 另有 checkpoint、CPU forward/backward 和 repack 边界。
+
+以下字段是嵌套视图，不能相加：
 
 ```text
-I_local = 384  -> 12 个 i_tile
-H       = 2048 -> 64 个 h_tile
-tile    = 32 × 32 × 32
-experts = 128
+wrapper.backward.total
+wrapper 下的 backward 子阶段
+tp.<index>.backward.total
+tp.<index> 下的子阶段
+worker_cpu.* 累计时间
 ```
 
-优化前任务粒度为：
+旧 `KT_BACKWARD_TIMING` summary/trace recorder 已从当前源码工作树移出并保存在 stash，但 2026-07-20 运行所用的 `Kllama` site-packages 和已构建 extension 仍是该旧 timing 版本。它的逐 step/layer CSV/JSON 能力尚未合入新 profiler；历史输出仍可读，但不能和新字段逐列混合。
 
-```text
-(expert, projection, i_tile, h_tile)
-128 × 2 × 12 × 64 = 196,608 tasks/layer/NUMA
-```
+## 8. 历史性能证据
 
-优化后任务粒度为：
+### 8.1 `f209878` 前后 A/B
 
-```text
-(expert, projection, i_tile)
-128 × 2 × 12 = 3,072 tasks/layer/NUMA
-```
+配置相同的相邻 `full -> lora` 会话：单卡、AMX BF16、2 NUMA、batch=1、GAS=1、seq=4096、15 steps、warmup 5、OMP=96、PyTorch fused AdamW。
 
-每个 task 在本线程中循环 64 个 `h_tile`，使固定 panel 得以复用：
-
-- Gate/Up：固定 `i_tile` 的 Gate A、Up A 全 K panel 只打包一次；
-- Down：固定 `i_tile` 的 intermediate B 全 K panel 只打包一次；
-- 每个 `h_tile` 的 input B panel 由 Gate/Up 共用；
-- 线程局部 scratch 按需扩容、跨 task 复用，并对齐到 64 byte。
-
-平均一个 expert 约有：
-
-```text
-4096 tokens × top-k 8 / 128 experts ≈ 256 routed tokens
-```
-
-即约 8 个 K tile。旧代码每个 K tile 后将 32×32 FP32 C tile 写到内存，并在下一 K tile 前重新加载：
-
-```text
-8 store_c + 7 load_c
-```
-
-新代码把完整 K reduction 放在：
-
-```cpp
-clean_c();
-for (int kt = 0; kt < k_tiles; ++kt) {
-  load_a_b();
-  run_tile();
-}
-store_c();
-```
-
-之间，使 C 在完整 K 循环内常驻 AMX tile 寄存器，最终只执行一次 `store_c()`。
-
-Gate 和 Up 各自占用 `GemmKernel224BF` 的完整四个 C tile，无法同时常驻。因此使用两个完整 K pass：先完整计算 Gate 并写回，再完整计算 Up。该设计用少量本地循环控制和额外 B reload，换取显著减少的 C tile load/store。
-
-详细 diff 设计见 [`AMXBF16-full-FT-gitdiff.md`](AMXBF16-full-FT-gitdiff.md)。
-
-### 4.6 `cpp_grad_buffer_clear`
-
-顶层 TP backward 在进入 NUMA 计算前清零：
-
-- 各 NUMA 的临时 `grad_input`；
-- 各 NUMA 的 router gradient partial buffer；
-- LoRA partial buffer，当前 Full rank=0 时基本为空；
-- 完整 `grad_gate_proj`；
-- 完整 `grad_up_proj`；
-- 完整 `grad_down_proj`。
-
-基座梯度清零是主要部分。dW 只为当前激活 experts 创建任务；如果某个 expert 当前 step 没有 token而梯度 buffer 未清零，它可能保留上一 step 的梯度并被 optimizer 错误更新。
-
-代码把 buffer 切成 2 MiB chunk，通过共享 WorkerPool 并行 `memset`。全部 CPU expert BF16 梯度约为：
-
-```text
-28.991B parameters × 2 bytes ≈ 54 GiB/step
-```
-
-后续可以尝试在当前层全部 experts 都激活时跳过基座梯度预清零，或只清未激活 expert；但必须验证 inactive expert、GAS、多 microbatch 和 PyTorch `.grad` 累积语义。
-
-### 4.7 `backward_repack_wait`
-
-该阶段不是等待 `base-weight dW` 内的动态 panel packing。
-
-Forward 和 dX 需要不同权重布局：
-
-```text
-forward: X  · Wᵀ
-dX:      dY · W
-```
-
-因此 dX 需要：
-
-```text
-gate_backward_bb_
-up_backward_bb_
-down_backward_bb_
-```
-
-即基座权重的转置 AMX `BufferB`。
-
-配置 `share_backward_bb=true` 时，每层不永久保存一整套 backward BufferB，而是每 NUMA 共用 shared backward-BB pool。完成当前层 backward 后，Python 为反向顺序中的下一层异步提交 repack，希望和 GPU attention backward 或其他工作重叠；进入下一层前调用 `wait_backward_repack()`。
-
-因此 `repack_wait` 只记录异步 repack 未被隐藏的尾部等待：
-
-- repack 已完成时，wait 接近零；
-- repack 未完成时，主 backward 线程通过 `join()` 阻塞；
-- 它服务于 Down/Gate/Up dX，不服务于 dW；
-- 它也不同于 optimizer 后的 `update_base_weights/requant`。
-
-## 5. 内部计时设计和口径
-
-Recorder 使用 Python `perf_counter_ns` 和 C++ `steady_clock` 测量已有函数/编排边界，不在 AMX tile 或 WorkerPool task 内逐次打点。
-
-一个 step 内：
-
-- 记录 48 次 layer backward；
-- Python 层将同名字段在 48 层上求和；
-- C++ NUMA 子阶段对两个 NUMA 取 `max`，近似关键路径；
-- `summary` 模式只输出 step aggregate，不输出每层、每 NUMA trace；
-- 不新增 CUDA synchronization。
-
-必须遵守以下口径：
-
-1. `outer_backward`、`autograd_total`、`wrapper_total`、`cpp_total` 和 `numa_critical_total` 是嵌套视图，不能相加。
-2. `numa_critical_*` 每个字段独立对 NUMA 取最大值，最慢 NUMA 可能因阶段而变化，所以子阶段最大值之和可能略大于 `numa_critical_total`。
-3. GPU-facing Python 阶段是 host-wall 边界；异步 CUDA 工作可能在后续已有同步点才被观察到。
-4. `base_weight_grad_ns` 覆盖整个 dW 函数，但 AMX tile、packing、task pickup 和缓存行为在该边界内部仍是不透明的。
-
-原始打点报告：
-
-- [`backward_timing.md`](../../FFTtest/Qwen3-30B-A3B/test_log/20260716_175359_1gpu_AMX_BF16_FULL/full_ft/phase4/step_timing/backward_internal/backward_timing.md)
-- [`backward_step.csv`](../../FFTtest/Qwen3-30B-A3B/test_log/20260716_175359_1gpu_AMX_BF16_FULL/full_ft/phase4/step_timing/backward_internal/backward_step.csv)
-- [`backward_timing.json`](../../FFTtest/Qwen3-30B-A3B/test_log/20260716_175359_1gpu_AMX_BF16_FULL/full_ft/phase4/step_timing/backward_internal/backward_timing.json)
-
-## 6. 稳定 step 的内部耗时
-
-稳定区间为 steps 6-15，共10步。`outer_backward=6.946782 s` 与 step probe 的 `backward_sec=6.947 s` 一致；`cpp_total=3.844781 s` 与 `cpuinfer_sync=3.846785 s` 只差约2 ms，说明边界计时内部自洽。
-
-```text
-outer backward                         6.947 s
-├─ 非 KT residual                     0.463 s
-└─ 48 层 KT autograd                  6.483 s
-   ├─ checkpoint recompute            2.079 s
-   ├─ backward repack wait            0.313 s
-   └─ wrapper backward                4.078 s
-      ├─ grad_output -> CPU           0.102 s
-      ├─ C++/CPUInfer                 3.845 s
-      │  ├─ 全量梯度 buffer 清零      0.340 s
-      │  ├─ NUMA 并行 backward        3.479 s
-      │  │  ├─ base-weight dW         2.036 s
-      │  │  ├─ Down base dX           0.665 s
-      │  │  ├─ Gate/Up base dX        0.643 s
-      │  │  └─ restore/activation/
-      │  │     router/prepare         约 0.18 s
-      │  └─ merge/barrier             约 0.025 s
-      └─ return gradients             0.124 s
-```
-
-| 阶段 | 每 step | 每层均值 | 占 outer backward | 作用 |
-|---|---:|---:|---:|---|
-| base-weight dW | 2.036 s | 42.41 ms | 29.3% | 生成 `dWgate/dWup/dWdown` |
-| checkpoint 重算 | 2.079 s | 43.32 ms | 29.9% | 恢复 forward activation/cache |
-| Down dX | 0.665 s | 13.86 ms | 9.6% | 计算 `dZ=dY·Wdown` |
-| Gate/Up dX | 0.643 s | 13.39 ms | 9.3% | 计算并合成 `dX` |
-| 全量梯度清零 | 0.340 s | 7.08 ms | 4.9% | 消除旧 step/inactive expert 残留 |
-| backward repack wait | 0.313 s | 6.52 ms | 4.5% | 等待 dX 所需转置 BufferB |
-
-`base-weight dW` 约占 NUMA 并行墙钟的 58.5%，占整个 C++ backward 的 53.0%，但只占完整 outer backward 的 29.3%。因此它仍是最大的 CPU 子函数，却不能代表完整 backward 的全部成本。
-
-稳定性：
-
-- outer backward 范围：6.904-6.996 s，CV约0.38%；
-- base-weight dW 范围：2.026-2.051 s，CV约0.34%；
-- repack wait 范围：0.287-0.343 s，CV约4.4%，相对更容易受流水重叠影响。
-
-## 7. dW 与 dX 的有效吞吐对比
-
-理论分析给出的 CPU expert backward 为 29.687 TFLOP/step。线性层的 dX 和 dW 各约占一半，即 14.843 TFLOP。
-
-据此估算：
-
-```text
-dW effective throughput
-  ≈ 14.843 TFLOP / 2.036 s
-  ≈ 7.29 TFLOPS
-
-dX effective throughput
-  ≈ 14.843 TFLOP / (0.665 + 0.643) s
-  ≈ 11.35 TFLOPS
-```
-
-大致相同的有用矩阵 FLOPs 下，dW 用时是 dX 的 1.56 倍。主要原因是：
-
-- dX 权重 BufferB 已预转置，可直接复用；
-- dW 两个 operand 均为动态数据，需要每 step packing；
-- routed expert 的 `M` 较小且不规则；
-- dW 还必须写出完整 BF16 参数梯度；
-- 尾部 expert-token 块需要 padding。
-
-这里的 TFLOPS 是模型“有用 FLOPs”估算，不等于硬件实际 AMX 指令吞吐，也没有计入 padding、packing、激活、路由和数据搬运。要判断 AMX feed 是否仍是主要限制，还需要 `perf` 或 VTune 的 AMX、cycles、cache 和 top-down 计数器。
-
-理论 FLOPs 文件：[`flops_analysis.json`](../../FFTtest/Qwen3-30B-A3B/test_log/20260716_175359_1gpu_AMX_BF16_FULL/full_ft/phase4/step_timing/flops_analysis.json)。
-
-## 8. 首步异常：梯度 buffer first-touch
-
-首步内部数据：
-
-```text
-cpp_grad_buffer_clear = 9.165 s
-outer_backward        = 18.212 s
-```
-
-稳定阶段：
-
-```text
-cpp_grad_buffer_clear = 0.340 s
-outer_backward        = 6.947 s
-```
-
-清零相差约27倍，而首步 NUMA AMX backward 仅从稳定的约3.48 s增加到约3.74 s。因此首步 backward 异常主要不是 dW kernel，而是约54 GiB大梯度内存的首次物理页分配、缺页和 NUMA first-touch。
-
-稳定清零的等效带宽约为：
-
-```text
-54 GiB / 0.340 s ≈ 159 GiB/s
-```
-
-首步不应计入稳定 AMX kernel 性能；但如果关注首次迭代延迟，应单独优化 Parameter/gradient 的预分配和 NUMA first-touch。
-
-## 9. 与前一组无内部打点运行的比较
-
-对照运行：
-
-```text
-20260716_143647_1gpu_AMX_BF16_FULL_THEN_LORA
-```
-
-Full 训练参数相同；本次额外启用了 backward summary timing，且只执行 Full。
-
-| 指标 | 前一组 | 本次 | 变化 |
+| Full 稳定指标 | 修改前 | `f209878` 后 | 变化 |
 |---|---:|---:|---:|
-| backward | 6.792 s | 6.947 s | +0.155 s / +2.28% |
-| forward | 1.346 s | 1.530 s | +0.184 s / +13.68% |
-| requant | 5.732 s | 6.746 s | +1.014 s / +17.69% |
-| optimizer | 1.925 s | 1.757 s | -0.168 s / -8.74% |
-| step | 16.140 s | 17.362 s | +1.222 s / +7.57% |
+| Step | 19.25197 s | 16.13997 s | -16.16% |
+| TPS | 212.76 | 253.78 | +19.28% |
+| Backward | 9.28085 s | 6.79183 s | -26.82% |
+| Optimizer | 1.79075 s | 1.92533 s | +7.52% |
+| Requant | 6.32860 s | 5.73156 s | -9.43% |
 
-不能把 backward 多出的155 ms直接判定为 recorder overhead。完整 step 的主要回退来自不在 recorder 范围内的 requant 和 forward；同时 recorder 不新增 CUDA synchronization。要测量打点本身的代价，应使用同一二进制做至少三组：
+同期 LoRA-only backward 只变化 -2.74%，支持主要收益来自 Full-only dW 路径。Forward/requant 也存在运行间变化，所以不能把完整 TPS 增益全部归给 dW。
 
-```text
-off -> summary -> off -> summary
-```
+### 8.2 旧内部 timing runs
 
-## 10. 剩余优化空间：先区分“必要计算”和“可避免开销”
+两次使用旧 recorder 的 Full-FT 运行配置一致，均统计稳定 steps 6–15：
 
-本次稳定 step 为17.362 s，TPS为235.92：
+| 运行 | Forward | Outer backward | Backward/Forward | Step | TPS |
+|---|---:|---:|---:|---:|---:|
+| `20260716_175359...` | 1.530 s | 6.947 s | 4.54× | 17.362 s | 235.92 |
+| `20260720_130854...` | 1.408 s | 6.671 s | 4.74× | 17.032 s | 240.49 |
 
-| 阶段 | 时间 | step 占比 |
-|---|---:|---:|
-| backward | 6.947 s | 40.0% |
-| requant/update_base_weights | 6.746 s | 38.9% |
-| forward | 1.530 s | 8.8% |
-| optimizer | 1.757 s | 10.1% |
-| 其他 | 0.382 s | 2.2% |
-
-Backward 内部已经识别出的四个大项为：
+最新 `20260720_130854...` 的稳定 backward 分解如下。顶层 `outer = autograd + non-KT residual`，而 wrapper、C++ 和 NUMA 字段是嵌套视图，不能跨层相加：
 
 ```text
-dW 2.036 + checkpoint 2.079 + clear 0.340 + repack wait 0.313
-= 4.768 s = outer backward 的 68.6%
+outer backward                 6.671 s
+├─ autograd total              6.128 s
+│  ├─ checkpoint recompute     1.991 s
+│  ├─ wrapper total            3.886 s
+│  ├─ backward repack wait     0.238 s
+│  └─ submit/other             0.013 s
+└─ non-KT residual             0.542 s
+
+wrapper/C++ 嵌套视图：
+  C++ total                    3.720 s
+  ├─ NUMA parallel wall        3.359 s
+  ├─ gradient buffer clear     0.336 s
+  └─ prepare/merge/barrier     0.025 s
+
+NUMA critical-path 近似：
+  base-weight dW               1.999 s
+  Down dX                      0.637 s
+  Gate/Up dX                   0.635 s
+  activation/router/restore    约 0.161 s
 ```
 
-这个68.6%是“已定位到可研究对象的时间”，不是可直接删除的时间：dW是 Full FT 必需计算；checkpoint 用计算换显存；清零涉及跨 microbatch 的梯度语义；`repack_wait` 也只在能把工作提前并成功重叠时才能隐藏。
+最新稳定 backward 范围为 6.635–6.710 s，forward 范围为 1.383–1.429 s，说明目标缺口不是随机抖动。两次 timing run 仍一致地把 checkpoint 和 dW 指向最大子项，也显示首步清零受约 54 GiB gradient first-touch 强烈影响。但二者都早于当前 8 个 commit，不能用于宣称 `BF16DWeightKernel` 或 direct reload 的当前耗时。
 
-### 10.1 单项 Amdahl 上限
+### 8.3 `backward <= 3 × forward` 的预算
 
-以下估算只改变一个阶段，其他阶段保持本次实测值：
-
-| 假设 | 节省时间 | 新 backward | 估算 TPS |
-|---|---:|---:|---:|
-| dW 耗时降低25% | 0.509 s | 6.438 s | 243.0 |
-| dW 达到当前 dX 的有效吞吐 | 0.728 s | 6.219 s | 246.2 |
-| dX 合计耗时降低20% | 0.262 s | 6.685 s | 239.5 |
-| checkpoint 重算降低25% | 0.520 s | 6.427 s | 243.2 |
-| 完全跳过本次全量清零 | 0.340 s | 6.607 s | 240.6 |
-| 完全隐藏 repack wait | 0.313 s | 6.634 s | 240.3 |
-| 完全删除 dW（不现实上限） | 2.036 s | 4.911 s | 267.3 |
-| 完全删除 checkpoint（不现实上限） | 2.079 s | 4.868 s | 268.0 |
-
-所以“还有空间”的答案是肯定的，但只继续打磨 dW，端到端 TPS 的合理单项目标更接近246 tok/s，而不是300 tok/s。Backward 与 requant 已经几乎并列，后续应同时优化两者。
-
-### 10.2 分层判断
-
-| 层级 | 目标 | 从本次打点可见的空间 | 判断 |
-|---|---|---:|---|
-| P0 | dW kernel/packing | 0.5–0.8 s | 最确定的计算内空间；dW有效吞吐7.29 TFLOPS，仅为当前 dX 的约64%。 |
-| P0 | selective checkpoint | 0.5–1.0 s（若减少25%–50%重算） | 绝对时间最大，但需要额外保存 activation，收益取决于内存预算。 |
-| P1 | 条件清零 | 上限0.340 s | 稳定且容易量化；必须先证明本 step 会完整覆盖相应梯度。 |
-| P1 | repack 流水 | 上限0.313 s | 当前看到的是尾部等待；总工作量未知，先找提交时机和 worker-pool 竞争。 |
-| P1 | dX kernel | 0.13–0.26 s（若降低10%–20%） | 已明显快于 dW，优先级低一档。 |
-| P2 | host copy/返回梯度 | `101.5 + 123.9 = 225.4 ms` | 可能与异步 CUDA 在既有阻塞点发生归因迁移，需 trace 后再改。 |
-| P2 | `non_kt_residual` | 0.463 s | 仍是黑盒边界，不能把全部时间视为 CPU 可优化开销。 |
-
-表中的区间是规划量级，不是已测得收益；多项同时修改时会竞争同一内存带宽和线程池，不能简单相加。作为工程目标，可先验证 backward 从6.95 s降到约5.5–6.0 s；若不改 requant，对应完整 step 约15.9–16.4 s，即约250–257 tok/s。
-
-## 11. 推荐的验证和优化顺序
-
-### 11.1 先拆 dW，而不是继续凭循环层数判断
-
-当前计时只有整个 `backward_base_weight_grad()` 边界。下一步在少量 trace 层中区分：
-
-- Gate/Up dW 与 Down dW；
-- dynamic A/B panel packing；
-- AMX compute；
-- FP32 C 到 BF16 的 conversion/store；
-- 每个 worker 的 task 数、有效 token 数和空转时间。
-
-不应给每个3,072-task strip都调用高开销墙钟。使用线程局部 cycle accumulator，退出 WorkerPool 后归约；同时采集 AMX tile 指令、cycles、IPC、cache miss、内存带宽以及24/48 worker扩展性。只有当 AMX compute 占比高且 tile 指令吞吐低时，才继续改 kernel；如果 packing/store 占比更高，应优先改数据布局和复用。
-
-### 11.2 用 trace 判断 NUMA 和路由不均衡
-
-选择层0、23、47记录两个 NUMA 的真实时间、active experts、每 expert routed tokens、`M` 分布和关键路径差异。当前 summary 对每个子阶段取 `max(NUMA0, NUMA1)`，无法判断慢的是固定 socket还是阶段间交替，子阶段最大值也可能来自不同 NUMA。
-
-### 11.3 条件清零必须先证明覆盖语义
-
-当128个 experts全部激活且本 step 的 dW会覆盖三组完整梯度 tensor 时，可以评估跳过 base-gradient 预清零；否则只清 inactive expert。回归必须覆盖非全激活路由、GAS>1、多 microbatch、TP part 0/1、非零 expert ID，以及连续 step inactive/active 交替。
-
-### 11.4 checkpoint 和 repack 分别处理
-
-- checkpoint：评估只保存 MoE 所需输入/路由 cache、保留其他模块 checkpoint 的选择性方案，并记录额外常驻内存；
-- repack：检查 backward-BB repack 是否可更早提交，以及 shared repack pool 与 checkpoint recompute 是否争用 CPU worker；
-- 对 `repack_wait` 波动层启用 trace，不能把312.9 ms等待直接当成312.9 ms可删除计算。
-
-### 11.5 每项优化都做同二进制交替对照
-
-至少执行三组稳定区间，并使用：
+以最新同一步计时口径计算：
 
 ```text
-baseline -> candidate -> baseline -> candidate
+forward                     = 1.408484 s
+3 × forward                 = 4.225452 s
+backward                    = 6.670751 s
+必须减少                    = 2.445299 s（backward 的 36.66%）
 ```
 
-同时报告 backward 子项、完整 step 和 TPS。内部 recorder 自身的开销则使用同二进制 `off -> summary -> off -> summary` 测量。
+仅关闭 gradient checkpointing 的算术上界是移除 1.990752 s recompute，使 backward 降至约 4.680 s，即 3.32× forward，**仍不能单独达标**。在此基础上，即使完全消除 0.335884 s 的 buffer clear，仍为 4.344 s（3.08×），还差约 0.119 s。
 
-## 12. 报告口径注意事项
+因此，一个可解释但尚未实测的达标预算是：关闭 checkpointing，加上消除完整 buffer clear，再隐藏约一半 repack wait；结果约为 4.225 s。等价地，最后 0.119 s 也可由约 6% 的 dW 墙钟优化补足。这只是阶段预算，不是性能预测：关闭 checkpointing 可能增加 GPU activation 峰值，清零不能在未证明覆盖语义前删除，把 repack 移到 reload 只会改变计时归属而不一定改善 step。
 
-1. 本次端到端性能采用 step probe 的 `17.362 s/step、235.92 tok/s`，而不是 `summary.md` 中基于 tqdm 日志时间戳的 `211.6 tok/s`。
-2. `step_timing.md` 的 phase legend 仍残留 “CPU DeepSpeedCPUAdam” 文案；训练日志实际显示 `AdamW` 和 `AcceleratedOptimizer`，当前运行没有使用 DeepSpeedCPUAdam。
-3. `numa_critical_*` 是关键路径近似，不是两个 NUMA 时间之和；各子阶段的 max 也不能保证来自同一个 NUMA。
-4. 整体 backward 的理论有效吞吐不等于 AMX tile 利用率；GPU non-expert、CPU expert、checkpoint 和同步位于不同嵌套边界。
-5. 本次 timing run 相比前一无内部打点 run 的 step 慢7.57%，主要变化落在 requant 和 forward；在同二进制交替实验前，不能归因给 recorder。
+该运行的 `monitor.csv` 记录 GPU 峰值 40,528 MiB、总容量 49,140 MiB，即 39.58 GiB / 47.99 GiB，真实表面余量
+是 8.41 GiB。旧写法把 MiB→GiB 的峰值与十进制总容量混在一起，因而把余量高估为 9.57 GB。
 
-## 13. 总体结论
+关闭 checkpoint 的 host cache 增量可以直接由当前 C++ 分配公式计算。Full-FT 的 `lora_rank=0`，每个 NUMA、
+每个 cache slot 为：
 
-1. Backward 仍有明确优化空间：约68.6%的时间已定位到 dW、checkpoint、清零和 repack wait，但其中只有一部分可真正消除。
-2. dW为2.036 s/step，是最大 CPU 子函数；它与 dX具有相近的有效 FLOPs，但耗时为dX的1.56倍。若达到当前 dX 的有效吞吐，可节省约0.728 s/step。
-3. checkpoint重算为2.079 s，是最大的策略性空间；它不能无条件删除，必须用额外 activation 内存换取时间。
-4. 条件清零和 repack流水各有约0.3 s理论上限，适合作为低风险、可独立验收的第二梯队。
-5. 首步慢主要由约54 GiB梯度 buffer首次触页导致，不应误判为稳定 AMX dW回退。
-6. 可把 backward 5.5–6.0 s作为下一阶段的验证目标，而不是承诺；若 requant不变，完整 TPS大约仍受限在250–257 tok/s。
-7. 完整 step 中 requant为6.746 s，已与 backward并列。要继续显著提高 TPS，必须并行推进 backward 和 requant，而不是只增加 AMX dW 内的循环级优化。
+```text
+input          = 4096 × 2048 × BF16                  =  16 MiB
+gate/up/inter  = 3 × 4096 × 8 × 384 × BF16          =  72 MiB
+down output    = 4096 × 8 × 2048 × BF16             = 128 MiB
+合计                                                   216 MiB / NUMA / slot
+两 NUMA                                                432 MiB / layer / slot
+```
+
+当前 checkpoint + shared pool + depth=2 只占 864 MiB（0.844 GiB）。关闭后若保持 depth=2，48 层独立 pool
+合计 40.50 GiB，净增 39.66 GiB（42.58 GB）；若同步设 depth=1，则合计 20.25 GiB，净增 19.41 GiB
+（20.84 GB）。以观测到的进程树 RAM 峰值 1056.99 GB 粗加，预计分别约为 1099.57 GB 或 1077.83 GB；这不含
+allocator 碎片和其他生命周期变化，但相对于 2 TB 主存并非容量风险。
+
+GPU activation 没有同样精确的静态值，因为它取决于 CUDA SDPA 后端、autograd 保存集合、梯度清零方式和 allocator
+复用。按当前 BF16、SDPA/GQA、`B=1,S=4096,H=2048,Q=32 heads,KV=4 heads,D=128` 估算，每层完整保存集合约
+0.24–0.28 GiB；扣除 checkpoint 已保存的 layer boundary 后，48 层常驻 activation 集合预计净增约
+11–13 GiB。由于 forward 结束时参数梯度通常尚未重新分配，且 backward 中 activation 释放与梯度生成相反，
+CUDA 峰值的实际净增可能只有约 6–10 GiB；若 SDPA 回退、K/V 被 repeat 或 allocator 碎片明显，则可能接近
+11–15 GiB。现有 8.41 GiB 余量处在该区间中间，因此 seq=4096 的 no-checkpoint 可能刚好运行，也可能 OOM，不能
+在短程实测前承诺。验收至少要记录 `torch.cuda.max_memory_allocated/reserved`，而不能只依赖 2.4 秒一次的 NVML
+采样。
+
+如果必须保留完整 checkpointing，则需要同时大幅优化 dW、dX、重算、清零和 CPU/GPU 重叠，达到 3× 的风险明显
+更高，不应承诺由单个 AMX kernel 修改完成。
+
+### 8.4 与 DeepSpeed 的 backward/optimizer 计时边界
+
+同样使用单卡、BF16、batch=1、GAS=1、seq=4096 和稳定 steps 6–15 的 DeepSpeed ZeRO-3 CPU Offload 对照记录：
+
+```text
+step total                         27.2399 s
+forward                             3.2919 s
+accelerator.backward 计时桶         23.9330 s
+显式 Trainer optimizer 计时桶          0 s
+```
+
+这里的 0 s 不是 CPU optimizer 没有成本。Accelerate 1.11.0 的 `DeepSpeedEngineWrapper.backward()` 先调用 `engine.backward()`，然后在 gradient-accumulation 边界调用 `engine.step()`。本次 GAS=1，所以每一步的 DeepSpeedCPUAdam、ZeRO step、gradient clipping、zero-grad 和 scheduler 都被记在 23.933 s 的 `accelerator.backward` 桶内。日志明确显示 `Adam Optimizer #0 is created with AVX512 arithmetic capability.`，因此不能把外层 optimizer 的 0 解读为真实 CPUAdam 时间。
+
+DeepSpeed 运行的 `wall_clock_breakdown=false`，现有日志无法把 23.933 s 拆成纯 GPU backward、ZeRO gradient partition/offload 和 CPUAdam/step。因此也不能把它与 KT 的 6.671 s 纯 outer backward 直接做倍数比较。
+
+只有粗粒度“forward 之后到权重已可用于下一 step”可以在现有边界上对齐：
+
+```text
+DeepSpeed backward + ZeRO + CPUAdam/step                     23.9330 s
+KT backward + clip + optimizer + post-optim + base reload    15.6101 s
+差值                                                            8.3230 s
+```
+
+这个对齐说明 KT 的完整更新路径比该 DeepSpeed 基线短 8.323 s，但不能说明差值是 CPUAdam 单项导致。KT 内部可继续拆成 6.671 s backward、2.257 s AdamW、0.332 s post-optim 和 6.327 s base reload。
+
+2026-07-21 已在 FFTtest 的 `step_timing_probe.py` 落地 DeepSpeed 运行时包装：分别累计 `DeepSpeedEngine.backward()`、`DeepSpeedEngine.step()`、ZeRO optimizer `step()` 和底层 `DeepSpeedCPUAdam.step()`，并保存 wrapper/engine/ZeRO 三层残差与调用次数。它不会把嵌套字段加入 TPS phase 总和。`exact` 模式在 instrumented DeepSpeed 边界同步 CUDA，适合拆分 completed-work 墙钟，但会改变异步重叠；`low_overhead` 不同步，适合估计探针扰动。专用入口 `run_deepspeed_full_ft_probe.sh` 强制 Full-FT，默认 35 steps、warmup 5、OMP=96。当前仅通过合成调用链与 dry-run，尚无新的 30B Full-FT 结果，因此上述 23.933 s 历史合并桶仍不能被反推拆分。
+
+## 9. 新旧结果不能混用
+
+| 对象 | 可以证明 | 不能证明 |
+|---|---|---|
+| `f209878` A/B | strip/panel/C-residency 方向有效 | `1e95053` 的 TPS |
+| 旧 timing runs（含 2026-07-20） | 安装环境中 `f209878 + KT_BACKWARD_TIMING` 的 checkpoint/dW/clear/repack 热点与 3× 预算 | 新 staged profiler 的字段值或 `1e95053` 性能 |
+| `1e95053` 源码 | 新 driver、profiler、direct reload 已进入 GitHub 树 | 构建、正确性或端到端性能已通过 |
+| GitHub mergeable | PR 可生成合并结果 | CI 或 Full-FT 训练通过 |
+
+## 10. 当前验证缺口
+
+2026-07-20 虽完成了一次旧安装环境的短训和内部打点，但没有重新构建当前源码；因此新 head 仍需在后续独立验收：
+
+1. Release extension 构建；
+2. staged profiler Python 测试；
+3. raw BF16 repack、dWeight reference 与 benchmark；
+4. Full/Hybrid/LoRA；
+5. checkpoint on/off 与 shared backward BB；
+6. TP/NUMA slice、inactive expert 和多 microbatch；
+7. Qwen3 Full-FT 短训与稳定 TPS。
+
+在这些验证完成前，文档只把 `1e95053` 标为“代码已同步”，不标为“运行时已验收”。
+
+## 11. 后续分析顺序
+
+新 profiler 已提供旧文档计划中的 dW 子阶段，因此下一次不需要再增加第二套 C++ timing。应按以下顺序使用现有字段：
+
+1. 同时读取外层 base-weight dW 墙钟和 worker CPU 累积时间，避免把并行时间误当关键路径；
+2. 比较 Gate/Up kernel、Down kernel、pack A/B、store，确定计算、packing 或内存写出谁占主导；
+3. 对比 `tp.0` 与 `tp.1` 的 tokens、routed rows、active experts 和阶段时间，定位 NUMA/路由不均衡；
+4. 分离 direct reload、forward pack、backward pack，验证新 reload 路径的真实收益；
+5. 再决定是否研究 selective checkpoint、条件清零、repack 提交时机或 dW kernel。
+
+每项性能结论必须使用同 commit、同构建、同配置的交替运行，并同时报告 step、TPS、backward 和 reload；不同 commit 的历史数字只能作为方向性参考。
+
+## 12. 总体结论
+
+1. 本地 backward 代码已同步到 GitHub `1e95053`，当前工作树不再包含重复的旧 timing 实现。
+2. 今日 head 将 `f209878` 的有效原型演进为通用 `BF16DWeightKernel`，并加入更细粒度 staged profiling。
+3. 最新旧环境实测为 6.671 s backward / 1.408 s forward，即 4.74×；达到 3× 需要减少至少 2.445 s（36.66%）。
+4. 关闭 checkpointing 单独只能推导到约 3.32×；结合清零缩减以及至少约 0.119 s 的 repack/dW/重叠收益，才有达标可能。
+5. 若必须保留完整 checkpointing，3× 仍属高风险多阶段优化目标，而不是单一 dW kernel 可保证的结果。
+6. 新 direct reload 减少中间分片和 memcpy，不等于取消 BufferB pack，也不能用移动阶段计时来替代 step 改善。
+7. 当前最重要的版本边界是：源码已同步到 `1e95053`；最新打点来自旧安装环境，current head 的构建、测试和 Qwen3 端到端结果仍未执行。
+8. DeepSpeed 的历史 23.933 s `accelerator.backward` 同时包含 `engine.backward()` 和 `engine.step()`；其显式 optimizer=0 是旧探针边界造成的未捕获，不能与 KT 2.257 s AdamW 直接比较。新四层探针已实现但尚未产生 Full-FT 实测。

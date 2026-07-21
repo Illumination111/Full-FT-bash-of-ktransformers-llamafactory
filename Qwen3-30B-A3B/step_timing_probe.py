@@ -7,7 +7,8 @@ Aligns with tqdm s/it (TPS denominator) by timing one optimizer-step cycle as:
   → update_base_weights (requant; may nest inside next forward)
   → _maybe_log_save_evaluate (logging / checkpoint / eval)
 
-Enabled by KT_STEP_TIMING=1.
+Enabled by KT_STEP_TIMING=1.  DeepSpeed nested timing is additionally selected
+with DS_PROBE_MODE=off|low_overhead|exact.
 """
 
 from __future__ import annotations
@@ -45,6 +46,12 @@ def _sync_cuda() -> None:
             torch.cuda.synchronize()
         except Exception:
             pass
+
+
+def _sync_cuda_exact() -> None:
+    """Synchronize without hiding CUDA failures when exact timing is requested."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 # Phases that attribute into the TPS step cycle (exclusive of step_total).
@@ -89,9 +96,54 @@ PHASE_LABELS = {
     "step_total_sec": "TOTAL (TPS cycle)",
 }
 
+# These are nested diagnostics, not additional TPS phases.  In DeepSpeed mode
+# Accelerate invokes engine.backward() and engine.step() from inside
+# accelerator.backward(), so adding these values to ATTRIBUTED_PHASES would
+# double-count the step.  Residuals make the nesting explicit:
+#
+# backward_sec
+#   = engine backward + engine step + Accelerate wrapper overhead
+# engine step
+#   = ZeRO optimizer step + other engine work
+# ZeRO optimizer step
+#   = CPUAdam step(s) + ZeRO/offload orchestration
+DEEPSPEED_DIAGNOSTIC_TIME_KEYS = (
+    "ds_engine_backward_sec",
+    "ds_engine_step_sec",
+    "ds_zero_optimizer_step_sec",
+    "ds_cpu_adam_step_sec",
+    "ds_wrapper_overhead_sec",
+    "ds_engine_step_other_sec",
+    "ds_zero_optimizer_overhead_sec",
+)
+
+DEEPSPEED_DIAGNOSTIC_CALL_KEYS = (
+    "ds_engine_backward_calls",
+    "ds_engine_step_calls",
+    "ds_zero_optimizer_step_calls",
+    "ds_cpu_adam_step_calls",
+)
+
+DEEPSPEED_DIAGNOSTIC_LABELS = {
+    "ds_engine_backward_sec": "DeepSpeedEngine.backward",
+    "ds_engine_step_sec": "DeepSpeedEngine.step (inclusive)",
+    "ds_zero_optimizer_step_sec": "ZeRO optimizer.step (inclusive)",
+    "ds_cpu_adam_step_sec": "DeepSpeedCPUAdam.step (sum of calls)",
+    "ds_wrapper_overhead_sec": "Accelerate wrapper residual",
+    "ds_engine_step_other_sec": "engine.step residual outside ZeRO optimizer",
+    "ds_zero_optimizer_overhead_sec": "ZeRO/offload residual outside CPUAdam",
+}
+
+DEEPSPEED_PROBE_MODES = ("off", "low_overhead", "exact")
+
 
 class StepTimingRecorder:
     PHASE_KEYS = (*ATTRIBUTED_PHASES, "step_total_sec")
+    CSV_KEYS = (
+        *PHASE_KEYS,
+        *DEEPSPEED_DIAGNOSTIC_TIME_KEYS,
+        *DEEPSPEED_DIAGNOSTIC_CALL_KEYS,
+    )
 
     def __init__(
         self,
@@ -100,16 +152,25 @@ class StepTimingRecorder:
         tokens_per_step: int = 0,
         finetune_mode: str = "unknown",
         backend: str = "kt",
+        deepspeed_probe_mode: str = "off",
     ) -> None:
         self.out_dir = Path(out_dir)
         self.warmup_skip = warmup_skip
         self.tokens_per_step = tokens_per_step
         self.finetune_mode = finetune_mode
         self.backend = backend
+        self.deepspeed_probe_mode = deepspeed_probe_mode
+        self.deepspeed_probe: dict[str, Any] = {
+            "mode": deepspeed_probe_mode,
+            "installed": False,
+            "components": {},
+        }
         self.steps: list[dict[str, Any]] = []
         self._cur: dict[str, float] | None = None
         self._step_t0: float | None = None
         self._accum: dict[str, float] = defaultdict(float)
+        self._diagnostic_accum: dict[str, float] = defaultdict(float)
+        self._diagnostic_calls: dict[str, int] = defaultdict(int)
         self._micro_count = 0
         self._pending_step: int | None = None
         self.enabled = True
@@ -126,6 +187,8 @@ class StepTimingRecorder:
         self._step_t0 = time.perf_counter()
         self._cur = defaultdict(float)
         self._accum = defaultdict(float)
+        self._diagnostic_accum = defaultdict(float)
+        self._diagnostic_calls = defaultdict(int)
         self._micro_count = 0
         self._stack = []
         self._pending_step = None
@@ -150,6 +213,13 @@ class StepTimingRecorder:
     def begin_phase(self, key: str) -> None:
         _sync_cuda()
         self._stack.append((key, time.perf_counter(), 0.0))
+
+    def add_diagnostic(self, key: str, dt: float, calls: int = 1) -> None:
+        """Accumulate nested diagnostics without changing exclusive phase timing."""
+        if self._cur is None:
+            return
+        self._diagnostic_accum[key] += max(0.0, float(dt))
+        self._diagnostic_calls[f"{key.removesuffix('_sec')}_calls"] += int(calls)
 
     def end_phase(self, key: str) -> None:
         if not self._stack:
@@ -199,6 +269,24 @@ class StepTimingRecorder:
             "step_other_sec": float(other),
             "step_total_sec": float(total),
         }
+        for key in DEEPSPEED_DIAGNOSTIC_TIME_KEYS[:4]:
+            row[key] = float(self._diagnostic_accum[key])
+        row["ds_wrapper_overhead_sec"] = max(
+            0.0,
+            row["backward_sec"]
+            - row["ds_engine_backward_sec"]
+            - row["ds_engine_step_sec"],
+        )
+        row["ds_engine_step_other_sec"] = max(
+            0.0,
+            row["ds_engine_step_sec"] - row["ds_zero_optimizer_step_sec"],
+        )
+        row["ds_zero_optimizer_overhead_sec"] = max(
+            0.0,
+            row["ds_zero_optimizer_step_sec"] - row["ds_cpu_adam_step_sec"],
+        )
+        for key in DEEPSPEED_DIAGNOSTIC_CALL_KEYS:
+            row[key] = int(self._diagnostic_calls[key])
         self.steps.append(row)
         self._cur = None
         self._step_t0 = None
@@ -214,6 +302,17 @@ class StepTimingRecorder:
             f"log={row['log_save_eval_sec']:.3f}s other={row['step_other_sec']:.3f}s",
             flush=True,
         )
+        if self.deepspeed_probe_mode != "off":
+            print(
+                "[deepspeed_probe] "
+                f"step={row['global_step']} "
+                f"engine_bwd={row['ds_engine_backward_sec']:.3f}s "
+                f"engine_step={row['ds_engine_step_sec']:.3f}s "
+                f"zero_step={row['ds_zero_optimizer_step_sec']:.3f}s "
+                f"cpu_adam={row['ds_cpu_adam_step_sec']:.3f}s "
+                f"cpu_adam_calls={row['ds_cpu_adam_step_calls']}",
+                flush=True,
+            )
 
     def mark_microbatch(self) -> None:
         self._micro_count += 1
@@ -232,7 +331,7 @@ class StepTimingRecorder:
             if not rows:
                 return {}
             out: dict[str, Any] = {"num_steps": len(rows)}
-            for key in self.PHASE_KEYS:
+            for key in (*self.PHASE_KEYS, *DEEPSPEED_DIAGNOSTIC_TIME_KEYS):
                 vals = [float(r[key]) for r in rows]
                 total = sum(vals)
                 out[key] = {
@@ -241,6 +340,14 @@ class StepTimingRecorder:
                     "median_sec": statistics.median(vals),
                     "min_sec": min(vals),
                     "max_sec": max(vals),
+                }
+            for key in DEEPSPEED_DIAGNOSTIC_CALL_KEYS:
+                vals = [int(r[key]) for r in rows]
+                out[key] = {
+                    "sum_calls": sum(vals),
+                    "mean_calls": sum(vals) / len(vals),
+                    "min_calls": min(vals),
+                    "max_calls": max(vals),
                 }
             total_sum = out["step_total_sec"]["sum_sec"]
             out["fraction_of_total"] = {
@@ -259,12 +366,19 @@ class StepTimingRecorder:
                 "forward_sec": "GPU model forward + loss, including ZeRO-3 parameter prefetch",
                 "backward_sec": "accelerator.backward / GPU autograd + ZeRO-3 gradient partitioning/offload",
                 "clip_grad_sec": "gradient clipping",
-                "optimizer_sec": "optimizer.step (DeepSpeedCPUAdam with CPU-offloaded states)",
+                "optimizer_sec": (
+                    "HF outer optimizer.step (normally a no-op under DeepSpeed; "
+                    "use ds_* nested diagnostics for ZeRO/CPUAdam)"
+                ),
                 "post_optim_sec": "lr_scheduler + zero_grad",
                 "update_base_weights_sec": "KT-only metric; expected to remain zero for DeepSpeed",
                 "log_save_eval_sec": "_maybe_log_save_evaluate (metric log / checkpoint / eval)",
                 "step_other_sec": "unaccounted wall time inside the TPS cycle",
                 "step_total_sec": "TPS cycle wall: dataloader → train → log/save (matches tqdm s/it)",
+                "deepspeed_nested_diagnostics": (
+                    "nested under backward_sec; never add them to TPS phases. "
+                    "engine.step includes ZeRO optimizer.step, which includes CPUAdam.step calls"
+                ),
             }
         else:
             phase_legend = {
@@ -295,6 +409,7 @@ class StepTimingRecorder:
             "aggregate_stable": agg_stable,
             "tps_attribution": tps_attr,
             "phase_legend": phase_legend,
+            "deepspeed_probe": self.deepspeed_probe,
         }
 
     def flush(self) -> dict[str, Any]:
@@ -311,7 +426,7 @@ class StepTimingRecorder:
         with csv_path.open("w", newline="") as f:
             writer = csv.DictWriter(
                 f,
-                fieldnames=["global_step", "microbatches", *self.PHASE_KEYS],
+                fieldnames=["global_step", "microbatches", *self.CSV_KEYS],
             )
             writer.writeheader()
             for row in self.steps:
@@ -402,6 +517,36 @@ def render_timing_markdown(summary: dict[str, Any]) -> str:
                     f"- if remove `{w['if_remove']}`: ~{w['tps_if_removed']:.1f} tok/s "
                     f"(remaining {w['remaining_sec']:.2f}s/step)"
                 )
+        lines.append("")
+
+    ds_probe = summary.get("deepspeed_probe") or {}
+    if ds_probe.get("mode", "off") != "off":
+        agg = summary.get("aggregate_stable") or summary.get("aggregate_all") or {}
+        lines.append("## DeepSpeed nested backward / optimizer probe")
+        lines.append("")
+        lines.append(
+            f"- mode: `{ds_probe.get('mode')}`; installed: `{bool(ds_probe.get('installed'))}`"
+        )
+        lines.append(
+            "- nested diagnostics only; do not add them to `step_total_sec` or to each other"
+        )
+        lines.append("")
+        lines.append("| Diagnostic | mean (s/step) | calls/step |")
+        lines.append("|---|---:|---:|")
+        call_key_by_time = dict(
+            zip(DEEPSPEED_DIAGNOSTIC_TIME_KEYS[:4], DEEPSPEED_DIAGNOSTIC_CALL_KEYS)
+        )
+        for key in DEEPSPEED_DIAGNOSTIC_TIME_KEYS:
+            stats = agg.get(key)
+            if not stats:
+                continue
+            call_stats = agg.get(call_key_by_time.get(key, "")) or {}
+            calls = call_stats.get("mean_calls")
+            calls_s = f"{calls:.2f}" if calls is not None else "-"
+            lines.append(
+                f"| `{key}` ({DEEPSPEED_DIAGNOSTIC_LABELS[key]}) | "
+                f"{stats['mean_sec']:.3f} | {calls_s} |"
+            )
         lines.append("")
 
     for title, key in (("All steps", "aggregate_all"), ("Stable steps only", "aggregate_stable")):
@@ -615,7 +760,7 @@ def render_summary_timing_section(
                 )
             elif key == "optimizer_sec":
                 hint = (
-                    "DeepSpeedCPUAdam；优化器状态在 CPU"
+                    "HF 外层通常为 0；ZeRO/CPUAdam 见下方 ds_* 嵌套探针"
                     if backend == "deepspeed"
                     else "AdamW；参数规模随 Full/LoRA 模式变化"
                 )
@@ -635,6 +780,28 @@ def render_summary_timing_section(
                 lines.append(
                     f"- 去掉 `{w['if_remove']}` → ~{w['tps_if_removed']:.1f} tok/s "
                     f"（剩余 {w['remaining_sec']:.2f}s/step）"
+                )
+            lines.append("")
+
+        ds_probe = step_timing.get("deepspeed_probe") or {}
+        if backend == "deepspeed" and ds_probe.get("mode", "off") != "off":
+            lines.append("**DeepSpeed backward / optimizer 嵌套探针（不可相加）:**")
+            lines.append("")
+            lines.append("| 诊断字段 | mean (s/step) | calls/step |")
+            lines.append("|---|---:|---:|")
+            call_key_by_time = dict(
+                zip(DEEPSPEED_DIAGNOSTIC_TIME_KEYS[:4], DEEPSPEED_DIAGNOSTIC_CALL_KEYS)
+            )
+            for key in DEEPSPEED_DIAGNOSTIC_TIME_KEYS:
+                stats = agg.get(key)
+                if not stats:
+                    continue
+                call_stats = agg.get(call_key_by_time.get(key, "")) or {}
+                calls = call_stats.get("mean_calls")
+                calls_s = f"{calls:.2f}" if calls is not None else "-"
+                lines.append(
+                    f"| `{key}` ({DEEPSPEED_DIAGNOSTIC_LABELS[key]}) | "
+                    f"{stats['mean_sec']:.3f} | {calls_s} |"
                 )
             lines.append("")
 
@@ -675,6 +842,131 @@ def render_summary_timing_section(
         lines.append("")
 
     return "\n".join(lines)
+
+
+def _wrap_deepspeed_method(
+    target: Any,
+    method_name: str,
+    recorder: StepTimingRecorder,
+    diagnostic_key: str,
+    *,
+    synchronize: bool,
+) -> bool:
+    """Wrap one bound DeepSpeed method while preserving its public signature."""
+    marker = f"_fft_ds_probe_{method_name}_wrapped"
+    if target is None or not hasattr(target, method_name):
+        return False
+    if getattr(target, marker, False):
+        return True
+
+    original = getattr(target, method_name)
+    if not callable(original):
+        return False
+
+    @functools.wraps(original)
+    def timed(*args, **kwargs):
+        # exact mode deliberately establishes a completed-work boundary on
+        # both sides.  low_overhead mode measures host wall time only.
+        if synchronize:
+            _sync_cuda_exact()
+        t0_ns = time.perf_counter_ns()
+        try:
+            return original(*args, **kwargs)
+        finally:
+            if synchronize:
+                _sync_cuda_exact()
+            recorder.add_diagnostic(diagnostic_key, (time.perf_counter_ns() - t0_ns) / 1e9)
+
+    setattr(target, method_name, timed)
+    setattr(target, marker, True)
+    return True
+
+
+def _install_deepspeed_timing_probe(trainer: Any, recorder: StepTimingRecorder) -> bool:
+    """Attach nested probes after Accelerate has constructed the DS engine."""
+    mode = recorder.deepspeed_probe_mode
+    if mode == "off":
+        return False
+    if recorder.deepspeed_probe.get("installed"):
+        return True
+
+    accelerator = getattr(trainer, "accelerator", None)
+    engine_wrapper = getattr(accelerator, "deepspeed_engine_wrapped", None)
+    engine = getattr(engine_wrapper, "engine", None)
+    if engine is None:
+        candidate = getattr(trainer, "model_wrapped", None)
+        if candidate is not None and "deepspeedengine" in type(candidate).__name__.lower():
+            engine = candidate
+    if engine is None:
+        return False
+
+    zero_optimizer = getattr(engine, "optimizer", None)
+    cpu_optimizer = getattr(zero_optimizer, "optimizer", None)
+    exact = mode == "exact"
+
+    components = {
+        "engine_backward": {
+            "class": type(engine).__name__,
+            "wrapped": _wrap_deepspeed_method(
+                engine,
+                "backward",
+                recorder,
+                "ds_engine_backward_sec",
+                synchronize=exact,
+            ),
+        },
+        "engine_step": {
+            "class": type(engine).__name__,
+            "wrapped": _wrap_deepspeed_method(
+                engine,
+                "step",
+                recorder,
+                "ds_engine_step_sec",
+                synchronize=exact,
+            ),
+        },
+        "zero_optimizer_step": {
+            "class": type(zero_optimizer).__name__ if zero_optimizer is not None else None,
+            "wrapped": _wrap_deepspeed_method(
+                zero_optimizer,
+                "step",
+                recorder,
+                "ds_zero_optimizer_step_sec",
+                synchronize=exact,
+            ),
+        },
+        "cpu_adam_step": {
+            "class": type(cpu_optimizer).__name__ if cpu_optimizer is not None else None,
+            "wrapped": _wrap_deepspeed_method(
+                cpu_optimizer,
+                "step",
+                recorder,
+                "ds_cpu_adam_step_sec",
+                # DeepSpeedCPUAdam.step is a synchronous host call.  CUDA
+                # synchronization here would only charge unrelated stream work.
+                synchronize=False,
+            ),
+        },
+    }
+    core_installed = components["engine_backward"]["wrapped"] and components["engine_step"]["wrapped"]
+    complete = core_installed and all(item["wrapped"] for item in components.values())
+    recorder.deepspeed_probe.update(
+        {
+            "installed": bool(core_installed),
+            "complete": bool(complete),
+            "synchronization": "CUDA boundaries" if exact else "host wall only",
+            "components": components,
+        }
+    )
+    print(
+        "[deepspeed_probe] "
+        f"mode={mode} installed={bool(core_installed)} complete={bool(complete)} "
+        f"engine={type(engine).__name__} "
+        f"zero_optimizer={type(zero_optimizer).__name__ if zero_optimizer is not None else 'missing'} "
+        f"cpu_optimizer={type(cpu_optimizer).__name__ if cpu_optimizer is not None else 'missing'}",
+        flush=True,
+    )
+    return bool(core_installed)
 
 
 class StepTimingCallback(TrainerCallback):
@@ -826,6 +1118,8 @@ def _patch_training_step(recorder: StepTimingRecorder) -> None:
 
     def timed_training_step(self, model, inputs, num_items_in_batch=None):
         recorder.mark_microbatch()
+        if recorder.backend == "deepspeed" and recorder.deepspeed_probe_mode != "off":
+            _install_deepspeed_timing_probe(self, recorder)
 
         orig_prepare = self._prepare_inputs
         orig_compute_loss = self.compute_loss
@@ -943,12 +1237,25 @@ def install_step_timing() -> StepTimingRecorder | None:
     tokens = _env_int("KT_STEP_TIMING_TOKENS_PER_STEP", 0)
     finetune_mode = os.environ.get("KT_FINETUNE_MODE", "unknown")
     backend = os.environ.get("FFT_TRAINING_BACKEND", "kt").lower()
+    deepspeed_probe_mode = os.environ.get("DS_PROBE_MODE", "off").strip().lower()
+    if deepspeed_probe_mode not in DEEPSPEED_PROBE_MODES:
+        raise ValueError(
+            f"Invalid DS_PROBE_MODE={deepspeed_probe_mode!r}; "
+            f"expected one of {', '.join(DEEPSPEED_PROBE_MODES)}"
+        )
+    if backend != "deepspeed" and deepspeed_probe_mode != "off":
+        print(
+            f"[deepspeed_probe] ignoring mode={deepspeed_probe_mode}: backend={backend}",
+            flush=True,
+        )
+        deepspeed_probe_mode = "off"
     recorder = StepTimingRecorder(
         out_dir=out_dir,
         warmup_skip=warmup,
         tokens_per_step=tokens,
         finetune_mode=finetune_mode,
         backend=backend,
+        deepspeed_probe_mode=deepspeed_probe_mode,
     )
     if os.environ.get("KT_BACKWARD_TIMING", "off").strip().lower() not in ("", "0", "off"):
         try:
@@ -1012,5 +1319,8 @@ def install_step_timing() -> StepTimingRecorder | None:
 
     Trainer.__init__ = patched_init
     Trainer._kt_step_timing_callback_installed = True
-    print(f"[step_timing] enabled -> {out_dir}", flush=True)
+    print(
+        f"[step_timing] enabled -> {out_dir}; deepspeed_probe={deepspeed_probe_mode}",
+        flush=True,
+    )
     return recorder

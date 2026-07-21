@@ -1,432 +1,214 @@
-# Full FT AMX backward dW 最小有效修改与 Git Diff
+# PR #2086、本地代码树与 AMX Full-FT Git Diff
 
-## 结论
+更新时间：2026-07-21
 
-本次 dW 修改有效，而且收益主要出现在预期的 Full-only base-weight dW 路径。必须区分三个状态：
+## 1. 当前结论
 
-1. **GitHub PR head**：PR #2086当前 head 为`fullft-development@f2098786f02ae4cd1d3f6a2968e15df7dfdf83fc`，仍为open；
-2. **已提交 dW 优化**：`f209878 [perf](kt-kernel): optimize AMX Full-FT weight gradients`，相对父提交为`1 file changed, 113 insertions(+), 86 deletions(-)`；
-3. **当前本地未提交修改**：是后续 backward timing instrumentation，不属于`f209878`，也不在当前GitHub PR head中。
-
-在配置完全相同的相邻两组 `full -> lora` 会话中，Full FT 稳定 backward 从 **9.28085 s** 降到 **6.79183 s（-26.82%）**，完整 step 从 **19.25197 s** 降到 **16.13997 s（-16.16%）**，TPS 从 **212.76** 提升到 **253.78（+19.28%）**。同期不调用该 dW 函数的 LoRA backward 仅变化 **-2.74%**，支持主要收益来自本次代码，而不是机器整体等比例变快。
-
-`f209878`的性能修改只在：
+本地仓库已经同步到 GitHub 当日最新 PR head，tracked 代码树保持一致：
 
 ```text
-/mnt/data2/wbw/ktransformers/kt-kernel/operators/amx/sft_moe.hpp
+仓库          /mnt/data2/wbw/ktransformers
+分支          fullft-development
+本地 HEAD     1e95053b15b32e6db8193fd852d62d051c6e7ef5
+fork tracking origin/fullft-development = 1e95053
+官方 PR ref   upstream/pr-2086           = 1e95053
+working tree  clean
 ```
 
-核心函数是`backward_base_weight_grad()`的AMX BF16分支，提交 diff 为：
+GitHub PR 为 [kvcache-ai/ktransformers#2086](https://github.com/kvcache-ai/ktransformers/pull/2086)。2026-07-17 刷新时状态为 open、非 draft、mergeable；head 没有 commit status。`mergeable=true` 只说明 GitHub 可以生成合并结果，不代表新 head 已完成 CI、扩展构建或 Full-FT 训练验收。
+
+同步前的 6 个 tracked 修改和 2 个 untracked timing 文件没有混入当前工作树，已完整保存在：
 
 ```text
-1 file changed, 113 insertions(+), 86 deletions(-)
+stash@{0}: pre-1e95053 KT_BACKWARD_TIMING integration 2026-07-17
 ```
 
-该提交没有修改Python/autograd、外部接口、TP布局、权重格式、全局WorkerPool、optimizer、requant，也没有改变`GemmKernel224BF`的`32×32×32` AMX tile形状。
+该 stash 是恢复副本，不属于 `1e95053`，也不能计入 PR diff。不要在未重新设计 profiler 接口前直接 `stash pop`。
 
-## 当前本地 worktree 与 GitHub head 的差异
+## 2. 本轮同步阶段
 
-当前`/mnt/data2/wbw/ktransformers`的`HEAD`与GitHub PR head相同，均为`f209878`；但本地另有未提交计时代码：
+### 阶段 A：刷新与核对
+
+- 通过 GitHub PR 元数据确认 head 仍为 `1e95053`；
+- 重新 fetch `origin/fullft-development` 与 `refs/pull/2086/head`；
+- 确认旧本地 HEAD `f209878` 是新 head 的祖先，可 fast-forward，落后 8 个 commit，没有分叉；
+- 确认原工作树仍是记录中的 6 个修改和 2 个新文件。
+
+### 阶段 B：保存本地现场
+
+使用包含 untracked 文件的 stash 保存原 timing 实验：
 
 ```text
-kt-kernel/ext_bindings.cpp                    +40
-kt-kernel/operators/amx/sft_moe.hpp           +67
-kt-kernel/operators/moe-sft-tp.hpp            +68
-kt-kernel/python/sft/amx.py                     +9
-kt-kernel/python/sft/autograd.py               +32
-kt-kernel/python/sft/base.py                 +31/-2
-kt-kernel/operators/sft-backward-timing.hpp    79 lines, untracked
-kt-kernel/python/sft/backward_timing.py        294 lines, untracked
+6 tracked files: 247 insertions, 2 deletions
+2 untracked files: 373 lines
+合计 8 files: 620 insertions, 2 deletions
 ```
 
-已跟踪文件合计`247 insertions, 2 deletions`，另有373行未跟踪计时支持代码。这些修改只增加可开关的summary/trace边界计时和报告导出，不是本节113/86行dW kernel优化的一部分。
+原实现单独维护 `KT_BACKWARD_TIMING` C++ struct、pybind API 和 Python recorder。GitHub 新增的 `KT_SFT_PROFILE` 已覆盖并细化大部分 C++ 阶段，两套实现不能直接叠加。
 
-测试仓库`FFTtest`还存在未提交的`monitor.py`、`run_finetune_perf_test_bf16.sh`和`step_timing_probe.py`修改，用于传递计时环境变量、归档内部计时结果和补充step口径；它们同样不在ktransformers的GitHub PR代码树内。
+### 阶段 C：fast-forward 并保持一致
 
-## 调用边界
+本地分支从 `f209878` fast-forward 到 `1e95053`。按本轮最终要求，没有继续合并 stash，也没有在 `ktransformers` 中保留新的未提交代码；因此当前 tracked 工作树与 fork/PR head 一致。
 
-三组 Full FT 基座权重梯度为：
+### 阶段 D：阶段性文档迁移
+
+本轮只更新 `FFTtest` 下的分析文档，明确新旧 commit、历史性能证据和未完成验证。没有修改已经同步干净的 `ktransformers` 代码树，也没有按用户最新要求继续运行测试。
+
+## 3. 三种 Git 比较口径
+
+### 3.1 PR 相对官方 base
+
+PR base 为 `upstream/main@7c021b4`，PR head 为 `1e95053`；共同祖先是 `8e46e58`。三点 diff：
 
 ```text
-grad_gate = grad_gate_out^T × input         [I, H]
-grad_up   = grad_up_out^T   × input         [I, H]
-grad_down = grad_output^T   × intermediate  [H, I]
+git diff 7c021b4...1e95053
+25 files changed, 2727 insertions(+), 260 deletions(-)
+17 commits
 ```
 
-调用处有明确的 Full-only 条件：
+必须使用三点 diff 或共同祖先统计 PR 内容。直接用两点 `git diff upstream/main fullft-development` 会同时混入官方 main 在共同祖先之后、但个人分支没有包含的提交。
 
-```cpp
-if (sft_config_.full_weight_grad && grad_gate_proj && grad_up_proj && grad_down_proj) {
-  backward_base_weight_grad(cache, full_intermediate_size,
-                            grad_gate_proj, grad_up_proj, grad_down_proj);
-}
-```
+### 3.2 旧本地 head 到今日 GitHub head
 
-因此：
-
-- Full FT 执行公共 base dX、activation backward、LoRA/adapter 条件路径以及本函数的 base dW；
-- LoRA-only 执行公共 base dX 和 adapter 梯度，但 `full_weight_grad=false`，不会进入本函数；
-- 本次 diff 不会直接加速 LoRA-only，LoRA 日志只能作为公共路径和环境波动的旁路对照。
-
-## 优化前的问题
-
-Qwen3-30B-A3B 每个 NUMA/TP 分区：
+本轮真正同步的范围是：
 
 ```text
-I_local = 384  -> 12 个 i_tile
-H       = 2048 -> 64 个 h_tile
-experts = 128
-tile    = 32 × 32 × 32
+f209878..1e95053
+15 files changed, 1524 insertions(+), 112 deletions(-)
+8 commits
 ```
 
-优化前一个任务对应一个输出 tile：
+文件级净变化：
+
+| 文件 | + | - | 主要作用 |
+|---|---:|---:|---|
+| `operators/sft_profile.hpp` | 239 | 0 | 通用 staged profiler 与阶段枚举 |
+| `operators/amx/la/bf16_dweight.hpp` | 168 | 0 | 共用 BF16 dWeight driver、scratch 和 worker timing |
+| `operators/amx/sft_moe.hpp` | 272 | 9 | 新 dW 调度、细粒度阶段、BF16 kernel/BufferB 复用 |
+| `operators/moe-sft-tp.hpp` | 136 | 58 | TP/NUMA profiler、direct reload 与 merge 路径 |
+| `operators/amx/la/amx_raw_buffers.hpp` | 112 | 5 | raw BF16 unpack、转置 pack 与 strided/direct pack |
+| `python/sft/profiler.py` | 149 | 0 | profile 收集、聚合和格式化 |
+| `python/sft/autograd.py` | 20 | 13 | PyTorch profiler 边界 |
+| `python/sft/layer.py` | 29 | 25 | forward/recompute/repack profile 边界 |
+| 三个聚焦测试 | 387 | 0 | profiler、raw repack、dWeight reference/benchmark |
+| 其他 binding/CMake/export | 12 | 2 | API 暴露与构建接入 |
+
+### 3.3 当前 working tree
+
+当前 `git status --short --branch` 仅显示：
 
 ```text
-(expert, projection, i_tile, h_tile)
-128 × 2 × 12 × 64 = 196,608 tasks / layer / NUMA
+## fullft-development...origin/fullft-development
 ```
 
-平均每个 expert 约 256 tokens，即 8 个 K tile。旧循环在每个 K tile 后 `store_c()`，下一 K tile 前再 `load_c()`；同一 Gate/Up input panel、固定 `i_tile` 的梯度 panel，也会在 64 个 `h_tile` 之间重复打包。
+因此当前 working-tree diff 为零。stash 不会出现在 `git diff` 中；它只表示存在可恢复的历史现场。
 
-最小有效修改同时解决三件事：
+## 4. 2026-07-17 新增的 8 个 commit
 
-1. 任务合并成固定 `i_tile` strip；
-2. 动态 operand panel 在任务内预打包并复用；
-3. FP32 C tile 在完整 K reduction 内常驻 AMX tile 寄存器。
+| commit | 作用 | 当前树净影响 |
+|---|---|---|
+| `9dc9d93` | staged SFT profiling | 新增 C++/Python profiler、pybind API 和测试 |
+| `c6f4211` | SFT 复用 inference BF16 kernel | 统一 `GemmKernel224BF16`，增加 raw BufferB 转换能力 |
+| `109b403` | Full-FT 细粒度 profiling | 区分 initial/recompute forward、dWeight、reload 与 PyTorch 边界 |
+| `34d2102` | batch BF16 Full-FT weight gradients | 新 `BF16DWeightKernel`、批量 dW 任务与 direct BF16 reload |
+| `ea84e6e` | dWeight benchmark | 增加 common driver 与 legacy 路径的性能门槛 |
+| `273e670` | profiler 标签修正 | 将 inner store 明确标为 worker CPU 累积时间 |
+| `61e63a8` | 临时性能文档 | 添加报告 |
+| `1e95053` | 删除临时性能文档 | 与上一 commit 对最终树净变化为零 |
 
-下面的 `diff` 块抽取关键行，并对少数长行重新换行以便阅读；未省略任何设计层面的修改。文件级原始 diff 请使用文末只读命令查看。
+所有 8 个 commit 的 committed date 都是 2026-07-17；`9dc9d93` 的 author date 较早不改变这一同步口径。
 
-## Git Diff 重点 1：对齐所需类型
+## 5. 当前 head 的实现变化
 
-```diff
-@@
- #include <chrono>
- #include <climits>
- #include <cmath>
-+#include <cstdint>
- #include <cstdio>
-```
+### 5.1 C++ profiler 成为唯一已提交计时源
 
-`std::uintptr_t` 用于把 `thread_local std::vector` 的数据指针向上对齐到 64 byte。没有替换全局 allocator，也没有新增持久化类成员。
+`SFTProfiler` 由 `KT_SFT_PROFILE` 在对象创建时启用，使用原子累计值记录：
 
-## Git Diff 重点 2：任务从 output tile 合并为 fixed-i strip
+- NUMA-local forward、backward、Down、Gate/Up、activation、router；
+- base-weight dW 的 offsets、matmul、pack A/B、Gate/Up kernel、Down kernel、store；
+- TP forward/backward、buffer clear、NUMA compute、grad merge；
+- backward repack 与 base-weight reload 的 partition/pack/cleanup。
 
-```diff
-@@ void backward_base_weight_grad(...)
- const int i_tiles = (I + TILE_M - 1) / TILE_M;
- const int h_tiles = (H + TILE_N - 1) / TILE_N;
--const int tiles_per_projection = i_tiles * h_tiles;
--const int tasks_per_expert = tiles_per_projection * 2;
-+// Keep enough fixed-i strips for load balancing while amortizing
-+// task pickup and panel packing over H.
-+const int tasks_per_expert = i_tiles * 2;
- const int total_tasks = activated_expert * tasks_per_expert;
+pybind 暴露 `get_profile_stats(reset=False)` 和 `reset_profile_stats()`；Python 提供 `collect_kt_sft_profile()`、`reset_kt_sft_profile()` 与格式化表格。`tp.<index>` 是各 NUMA-local 子核的累计 scope；并行 worker 的 CPU 累积时间不能当成外层墙钟。
 
- pool->do_work_stealing_job(
-     total_tasks, [](int _) { T::config(); },
--    [&, i_tiles, h_tiles, tiles_per_projection, tasks_per_expert](int task_id) {
-+    [&, i_tiles, h_tiles, tasks_per_expert](int task_id) {
-       const int expert_task = task_id / tasks_per_expert;
-       const int local_task = task_id % tasks_per_expert;
--      const bool do_down = local_task >= tiles_per_projection;
--      const int tile_id = do_down ? local_task - tiles_per_projection : local_task;
-+      const bool do_down = local_task >= i_tiles;
-+      const int i_tile = local_task % i_tiles;
-```
+### 5.2 `f209878` dW 原型被通用 driver 取代
 
-变化后的任务是：
+`f209878` 证明了 fixed-`i_tile` strip、线程局部 panel 和 C tile 跨 K 常驻的方向有效。新 head 没有简单保留旧函数内手写循环，而是抽出 `BF16DWeightKernel`：
 
-```text
-(expert, projection, i_tile)
-128 × 2 × 12 = 3,072 tasks / layer / NUMA
-```
+- 复用 inference 的 `GemmKernel224BF16` driver；
+- 只为 active experts 创建任务；
+- Gate/Up 共用 input panel；Down 固定 `i_tile` 复用 intermediate panel；
+- 使用线程局部对齐 scratch；
+- 将 pack、kernel、store 分别累计到 staged profiler；
+- 保留 fallback 路径及更细的正确性/性能测试。
 
-任务领取次数理论上减少 64 倍。每个 NUMA 有 48 workers 时仍平均有 64 tasks/worker，保留了足够的 work-stealing 粒度。
+因此旧 `f209878` 的源码 diff 只能作为历史设计依据，不能再描述成 `1e95053` 的当前实现。
 
-## Git Diff 重点 3：线程局部、按需扩容、64-byte 对齐的 panel scratch
+### 5.3 BF16 weight reload 改为 direct pack
 
-```diff
-@@
--alignas(64) ggml_bf16_t a_tile[TILE_M * TILE_K];
--alignas(64) ggml_bf16_t b_tile[TILE_N * TILE_K];
-+const int k_tiles = (m + TILE_K - 1) / TILE_K;
-+constexpr size_t A_TILE_ELEMENTS = TILE_M * TILE_K;
-+constexpr size_t B_TILE_ELEMENTS = TILE_N * TILE_K;
-+constexpr size_t TILE_ALIGNMENT = 64;
-+constexpr size_t ALIGNMENT_PADDING =
-+    TILE_ALIGNMENT / sizeof(ggml_bf16_t);
-+const size_t packed_a_elements =
-+    (size_t)k_tiles * A_TILE_ELEMENTS;
-+const size_t packed_b_elements =
-+    (size_t)k_tiles * B_TILE_ELEMENTS;
-+
-+thread_local std::vector<ggml_bf16_t> packed_a0_storage;
-+thread_local std::vector<ggml_bf16_t> packed_a1_storage;
-+thread_local std::vector<ggml_bf16_t> packed_b_storage;
-+auto resize_aligned = [](std::vector<ggml_bf16_t>& storage,
-+                         size_t elements) {
-+  const size_t required = elements + ALIGNMENT_PADDING;
-+  if (storage.size() < required) storage.resize(required);
-+  const auto raw =
-+      reinterpret_cast<std::uintptr_t>(storage.data());
-+  const auto aligned =
-+      (raw + TILE_ALIGNMENT - 1) &
-+      ~(std::uintptr_t)(TILE_ALIGNMENT - 1);
-+  return reinterpret_cast<ggml_bf16_t*>(aligned);
-+};
-+
-+ggml_bf16_t* packed_a0 =
-+    resize_aligned(packed_a0_storage, packed_a_elements);
-+ggml_bf16_t* packed_b =
-+    resize_aligned(packed_b_storage, packed_b_elements);
- alignas(64) float c0[TILE_M * TILE_N];
-```
+新 head 可从完整 CPU BF16 Parameter 按 TP/NUMA stride 直接 pack 到 forward BufferB，并生成 backward 转置 BufferB，减少旧路径的临时 gate/up/down 分片分配和 memcpy。
 
-scratch 特性：
+这不等于“消除了 requant/reload”：完整 BufferB pack 仍会执行，只是数据路径和中间分配更直接。新 profiler 已把 direct pack、forward pack、backward pack、partition 和 cleanup 分开。
 
-- 每个 WorkerPool thread 各自拥有，不共享写入，无需锁；
-- 只在当前遇到的 `k_tiles` 更大时扩容，跨任务和跨函数调用复用容量；
-- 尾部 M/I/H 继续先清零再填有效范围，保持 padding 语义；
-- 平均 `M=256` 时，每个 packed panel 是 `8 × 32 × 32 × 2 B = 16 KiB`，三个 panel 合计约 48 KiB/worker。
+## 6. 性能证据的归属
 
-## Git Diff 重点 4：Down 固定 B panel，并让 C 跨完整 K 常驻
+`20260715_203338...` 与 `20260716_143647...` 的 A/B 证明 `f209878` 原型有效：
 
-Down 的固定 `i_tile` 对应 intermediate B。它先一次性打包全部 K panel，然后在 `h_tile` 循环中只重新打包 grad-output A：
-
-```diff
-@@ Down path
-+const ggml_bf16_t* grad_output =
-+    base_grad_output_bf16_ptr_[expert_idx];
-+const ggml_bf16_t* intermediate =
-+    cache.intermediate_cache + pos_start * I;
-+std::memset(packed_b, 0,
-+            packed_b_elements * sizeof(ggml_bf16_t));
-+for (int kt = 0; kt < k_tiles; kt++) {
-+  const int k_start = kt * TILE_K;
-+  const int k_count = std::min(TILE_K, m - k_start);
-+  ggml_bf16_t* b_tile =
-+      packed_b + (size_t)kt * B_TILE_ELEMENTS;
-+  for (int col = 0; col < i_count; col++) {
-+    for (int kk = 0; kk < k_count; kk++) {
-+      b_tile[col * TILE_K + kk] =
-+          intermediate[(size_t)(k_start + kk) * I +
-+                       i_start + col];
-+    }
-+  }
-+  amx::transpose_16x16_32bit(
-+      reinterpret_cast<__m512i*>(b_tile));
-+  amx::transpose_16x16_32bit(
-+      reinterpret_cast<__m512i*>(
-+          b_tile + amx::GemmKernel224BF::TILE_N * TILE_K));
-+}
-```
-
-最关键的 C tile diff：
-
-```diff
-@@ old K loop
--T::load_b(b_tile, TILE_K * sizeof(ggml_bf16_t));
--T::load_a(a_tile, TILE_K * sizeof(ggml_bf16_t));
--if (k_start == 0) {
--  T::clean_c();
--} else {
--  T::load_c(c0, TILE_N * sizeof(float));
--}
--T::run_tile();
--T::store_c(c0, TILE_N * sizeof(float));
-+// Keep the full 32x32 FP32 C tile resident for the complete K reduction.
-+T::clean_c();
-+for (int kt = 0; kt < k_tiles; kt++) {
-+  T::load_b(packed_b + (size_t)kt * B_TILE_ELEMENTS,
-+            TILE_K * sizeof(ggml_bf16_t));
-+  T::load_a(packed_a0 + (size_t)kt * A_TILE_ELEMENTS,
-+            TILE_K * sizeof(ggml_bf16_t));
-+  T::run_tile();
-+}
-+T::store_c(c0, TILE_N * sizeof(float));
-```
-
-平均 8 个 K tile 时，每个输出 tile 从 8 次 `store_c` + 7 次 `load_c` 变成最后 1 次 `store_c`。
-
-## Git Diff 重点 5：Gate/Up 共用 input B，分别占用完整 C tile 集合
-
-固定 `i_tile` 后，Gate A 和 Up A 的全部 K panel 各打包一次：
-
-```diff
-@@ Gate/Up fixed-i panels
-+ggml_bf16_t* packed_a1 =
-+    resize_aligned(packed_a1_storage, packed_a_elements);
-+std::memset(packed_a0, 0,
-+            packed_a_elements * sizeof(ggml_bf16_t));
-+std::memset(packed_a1, 0,
-+            packed_a_elements * sizeof(ggml_bf16_t));
-+for (int kt = 0; kt < k_tiles; kt++) {
-+  const int k_start = kt * TILE_K;
-+  const int k_count = std::min(TILE_K, m - k_start);
-+  ggml_bf16_t* gate_a_tile =
-+      packed_a0 + (size_t)kt * A_TILE_ELEMENTS;
-+  ggml_bf16_t* up_a_tile =
-+      packed_a1 + (size_t)kt * A_TILE_ELEMENTS;
-+  for (int row = 0; row < i_count; row++) {
-+    for (int kk = 0; kk < k_count; kk++) {
-+      gate_a_tile[row * TILE_K + kk] =
-+          grad_gate_output_[
-+              (pos_start + k_start + kk) * I + i_start + row];
-+      up_a_tile[row * TILE_K + kk] =
-+          grad_up_output_[
-+              (pos_start + k_start + kk) * I + i_start + row];
-+    }
-+  }
-+}
-```
-
-每个 `h_tile` 的 input B 只打包一次，Gate 和 Up 两个 pass 共用。Gate 和 Up 都需要 `GemmKernel224BF` 的全部四个 C tile，不能同时常驻，所以正确结构是两个完整 K pass：
-
-```diff
-@@ Gate/Up C-resident passes
-+// Gate and up each consume all four C tiles,
-+// so retain C across K in two separate passes.
-+T::clean_c();
-+for (int kt = 0; kt < k_tiles; kt++) {
-+  T::load_b(packed_b + (size_t)kt * B_TILE_ELEMENTS,
-+            TILE_K * sizeof(ggml_bf16_t));
-+  T::load_a(packed_a0 + (size_t)kt * A_TILE_ELEMENTS,
-+            TILE_K * sizeof(ggml_bf16_t));
-+  T::run_tile();
-+}
-+T::store_c(c0, TILE_N * sizeof(float));
-+
-+T::clean_c();
-+for (int kt = 0; kt < k_tiles; kt++) {
-+  T::load_b(packed_b + (size_t)kt * B_TILE_ELEMENTS,
-+            TILE_K * sizeof(ggml_bf16_t));
-+  T::load_a(packed_a1 + (size_t)kt * A_TILE_ELEMENTS,
-+            TILE_K * sizeof(ggml_bf16_t));
-+  T::run_tile();
-+}
-+T::store_c(c1, TILE_N * sizeof(float));
-```
-
-不能把 Gate 和 Up 合成一次 `clean_c()` 后交错运行，因为两次 `run_tile()` 都写同一组 C tile，会把两个 projection 累加到一起。
-
-## 数值和并发不变量
-
-本次修改保持以下不变量：
-
-- 每个 `(expert, projection, i_tile, h_tile)` 输出区域仍只有一个任务写，不需要原子加或互斥锁；
-- 每个输出元素的 K 累加顺序仍按 `kt=0..k_tiles-1`，没有分线程 reduction；
-- `m`、`I`、`H` 非 32 整数倍时，先清零整块 scratch，再只复制有效元素；
-- Gate/Up/Down 最终写回的逻辑 layout 和 BF16 转换没有变化；
-- 非 AMX BF16 的 fallback 路径没有变化；
-- TP 分区仍使用原 `I=full_intermediate_size/tp_part` 和原 expert/gradient pointer。
-
-构建与 reference 验证：
-
-- Release 构建通过；
-- TP part 0/1、非零 expert 通过；
-- `M={1,31,32,33,65,256}` 通过；
-- Qwen 维度 `H=2048, I_local=384` 的 `M=33/256` 通过；
-- Gate/Up/Down dW 均与 reference 对照通过。
-
-## 性能证据
-
-对照会话：
-
-- 修改前：`FFTtest/Qwen3-30B-A3B/test_log/20260715_203338_1gpu_AMX_BF16_FULL_THEN_LORA`
-- 修改后：`FFTtest/Qwen3-30B-A3B/test_log/20260716_143647_1gpu_AMX_BF16_FULL_THEN_LORA`
-- 两个 `session_config.json` 的文本 diff 为空。
-
-Full 稳定区间：
-
-| 指标 | 修改前 | 修改后 | 变化 |
-| --- | ---: | ---: | ---: |
+| 指标 | 修改前 | `f209878` 后 | 变化 |
+|---|---:|---:|---:|
 | Step | 19.25197 s | 16.13997 s | -16.16% |
 | TPS | 212.76 | 253.78 | +19.28% |
-| Forward | 1.47821 s | 1.34553 s | -8.98% |
-| Backward | 9.28085 s | 6.79183 s | **-26.82%** |
-| Optimizer | 1.79075 s | 1.92533 s | +7.52% |
-| Requant | 6.32860 s | 5.73156 s | -9.43% |
+| Backward | 9.28085 s | 6.79183 s | -26.82% |
 
-目标 backward 节省 2.48902 s，占完整 step 节省 3.11200 s 的约 80.0%。同一理论 FLOPs 模型下，backward 有效吞吐从 11.412 提升到 15.594 TFLOPS（+36.65%），roofline 下界效率从 9.95% 提升到 13.59%，日志判断由“偏低”变为“正常”。这仍是整个 backward 的模型估算，不是硬件 AMX tile 利用率；forward 和 requant 也有运行间变化，所以不能把全部 TPS 增益都归因于 dW。
+LoRA-only backward 同期只变化 -2.74%，支持收益集中在 Full-only dW 路径。但这些运行都早于 `9dc9d93..1e95053`，不能直接当作新 head 的性能结果。
 
-LoRA 旁路对照：
+`20260716_175359...` 的内部 timing 也来自旧的本地 `KT_BACKWARD_TIMING` 实现。它可以继续作为历史热点证据，但字段不能与新 `SFTProfiler` 输出逐列混用。
 
-| 指标 | 修改前会话 | 修改后会话 | 变化 |
-| --- | ---: | ---: | ---: |
-| Step | 6.08625 s | 5.86640 s | -3.61% |
-| TPS | 672.99 | 698.21 | +3.75% |
-| Forward | 1.63101 s | 1.54067 s | -5.54% |
-| Backward | 4.35296 s | 4.23380 s | -2.74% |
+## 7. 验证状态
 
-LoRA backward 的公共波动约 0.119 s；Full backward 则减少 2.489 s。简单绝对差分仍留下约 **2.370 s/step** 的 Full-only 额外收益。
+本轮目标是同步代码树与迁移文档，按用户最新要求没有继续运行测试。当前可以确认的是 Git 与代码树状态，不是运行时正确性：
 
-新 Full 运行 15 steps、退出码 0；稳定 backward 为 6.755–6.829 s，稳定 step 为 16.008–16.290 s。loss 从 0.7773 降到 0.2754，grad norm 为 1.685–5.276。日志 summary 的基础健康检查判定无 SIGSEGV/NaN。
+- 已确认本地、fork tracking ref、官方 PR ref 三者同为 `1e95053`；
+- 已确认 working tree clean；
+- 已确认 PR head 没有 commit status；
+- 没有在本轮对 `1e95053` 执行 extension build、profiler pytest、AMX dWeight/repack 测试或 Qwen3 训练。
 
-## 和 LoRA backward 优化的关系
+因此不得写成“新 head 已构建通过”或“新 head TPS 为 253.78”。
 
-### LoRA 当前优化了什么
+## 8. 后续恢复边界
 
-当前 LoRA backward 主要包括：
+若以后继续整合旧 timing stash，应遵循：
 
-- base dX：`BufferA::from_mat()` + 预转置 base-weight `BufferB` + `amx::mat_mul()`；
-- Gate/Up adapter：融合 `input -> u` 与 grad-B，按 token 分块，rank=8 使用 AVX2 FMA；
-- Down adapter：按 token 或输出维分块，使用线程局部 FP32 accumulator，最后分块写回；
-- route scatter/fused add：AVX512 BF16/FP32 转换和 FMA；
-- 中间结果：共享 pool、per-expert view 和复用 scratch，避免反复大对象分配。
+1. 先从 stash 导出/查看 diff，不直接 pop 到当前开发分支；
+2. 复用 `SFTProfiler` stage、pybind 和 Python API，不恢复重复 C++ timing struct；
+3. 只保留通用 profiler 尚未提供的逐 step、microbatch、layer/NUMA trace 和输出归档能力；
+4. 另建分支或 worktree，完成冲突整合后再测试；
+5. 测试完成前保持 `full/hybrid/lora`、checkpoint on/off 与 direct reload 的验证缺口为“未验证”。
 
-这些优化的共同原则是融合、分块、复用数据和减少中间内存流量。
-
-### LoRA 是否调整了 AMX tile 打包逻辑
-
-需要区分三层：
-
-1. **底层 AMX tile config/形状：没有调整。** 仍是 `GemmKernel224BF` 的固定 tile 和通用 `amx::mat_mul()`。
-2. **公共 base dX packing：有标准打包，但不是 LoRA-specific 改动。** Full 和 LoRA 都把动态 grad 转成 `BufferA`，把 base weight 预先转置成 `BufferB`。
-3. **LoRA adapter backward 的 live 实现：主要走 AVX，不是自定义 AMX tile packing。** `prepare_lora_backward_weights()` 仍准备 `down_lora_a_t_bb_`/`down_lora_b_t_bb_`，但当前文件中这两个对象除分配和准备外没有消费点；实际 adapter backward 使用 `avx::lora_*`。
-
-所以准确结论是：**LoRA 保留了 AMX BufferB 打包准备设施，公共 base dX 依赖标准 AMX packing；但当前 LoRA-specific backward 优化没有改变底层 AMX tile，也没有调整 live AMX tile packing 循环。**
-
-### Full FT 方向是否正确
-
-正确。Full dW 的两个 operand 都来自当前 step 的 activation/gradient，不能像 base dX 的权重 `BufferB` 那样跨 step 长期缓存。本次选择在单次 dW 内：
-
-- 固定 strip 后复用不变 panel；
-- Gate/Up 共用 input B；
-- 合并 task，降低调度频率；
-- 让 C 跨完整 K 常驻；
-- 使用线程局部 scratch 避免共享和反复分配。
-
-这与 LoRA 的优化原则一致，又符合 Full dW 的数据生命周期。实测 Full backward -26.82%、LoRA 旁路仅 -2.74%，也验证了方向。
-
-函数级和编排边界计时已在本地worktree实现。`20260716_175359...`稳定结果显示`backward_base_weight_grad()`为2.036 s/step，占完整outer backward的29.3%；checkpoint重算为2.079 s，requant为6.746 s。因此下一步应继续拆分dW中的Gate/Up、Down、dynamic packing、AMX compute与BF16 store，并采集AMX/cycles/cache/top-down计数器；不要在缺少这些证据时先改tile形状或全局WorkerPool。
-
-## 查看完整 Git Diff
-
-本文主体描述的是已提交的`f209878`，不是当前未提交计时 diff。分别使用以下只读命令查看：
+## 9. 只读核对命令
 
 ```bash
 cd /mnt/data2/wbw/ktransformers
-git show --stat --oneline f209878
-git diff f209878^ f209878 -- kt-kernel/operators/amx/sft_moe.hpp
-git status --short
-git diff --stat
-git diff -- kt-kernel/operators/amx/sft_moe.hpp
+
+git status --short --branch
+git rev-parse HEAD origin/fullft-development upstream/pr-2086
+git log --reverse --oneline f209878..1e95053
+git diff --shortstat f209878..1e95053
+git diff --numstat f209878..1e95053
+git diff --shortstat 7c021b4...1e95053
+git stash list
+git stash show --stat --include-untracked stash@{0}
 ```
 
-前两个命令查看已提交dW优化；后三个命令查看GitHub head之外的本地计时修改。未跟踪文件不会出现在`git diff --stat`中，需结合`git status --short`。
+这些命令分别核对当前同步状态、今日 8 个 commit、完整 PR 三点 diff 和本地恢复副本，四种对象不能混为一谈。
 
-当前实现主体位于：
+## 10. FFTtest working-tree 变更
 
-```text
-kt-kernel/operators/amx/sft_moe.hpp:1926  backward_base_weight_grad()
-kt-kernel/operators/amx/sft_moe.hpp:1949  AMX BF16 optimized branch
-kt-kernel/operators/amx/sft_moe.hpp:2001  Down strip
-kt-kernel/operators/amx/sft_moe.hpp:2052  Gate/Up strip
-```
+以下变更发生在独立仓库 `/mnt/data2/wbw/FFTtest`，不改变 `/mnt/data2/wbw/ktransformers@1e95053`；因此不能混入 PR #2086 的 25-file 三点 diff。
 
-## 10. FFTtest 可视化 working-tree 变更
+### 10.1 2026-07-20 可视化精简
 
-2026-07-20 的可视化精简发生在独立仓库 `/mnt/data2/wbw/FFTtest`，不改变 `/mnt/data2/wbw/ktransformers` 代码树。比较基线为：
+比较基线为：
 
 ```text
 仓库          /mnt/data2/wbw/FFTtest
@@ -442,3 +224,24 @@ HEAD/base     d76dc2bc386e15e289480b235e19b580df2eb50b
 - `run_full_ft_test_1gpu_bf16_frozen.sh` 不再引用已移除的 `04_grad_norm.png`，Router 稳定性改为引用训练日志中的数值检查。
 
 `test_log/` 被 `.gitignore` 排除，因此历史图片的删除与 `07_tps.png -> 03_tps.png` 重命名不会出现在 tracked Git diff 中。进入本轮前，`AGENTS.md` 和多份 AMX 文档已经存在其他未提交修改；本轮保留这些修改，没有将其误记为上述 4 个脚本的可视化 diff。
+
+### 10.2 2026-07-21 DeepSpeed backward/optimizer 探针
+
+本轮只修改 FFTtest 的 Python/runner，不修改 DeepSpeed、Accelerate、LLaMA-Factory 或 ktransformers 安装树。相对 `FFTtest@d76dc2b`，本轮探针代码范围为：
+
+```text
+Qwen3-30B-A3B/step_timing_probe.py                       +316 / -6
+Qwen3-30B-A3B/run_finetune_perf_test_bf16_deepspeed.sh   +22 / -2
+Qwen3-30B-A3B/run_deepspeed_full_ft_probe.sh              52 lines（新文件）
+代码范围合计                                             +390 / -8
+```
+
+实现内容：
+
+- `step_timing_probe.py` 在 Accelerate 完成 DeepSpeed engine 构造后，运行时包装 `DeepSpeedEngine.backward/step`、ZeRO optimizer `step` 与底层 CPU optimizer `step`；
+- 新字段作为嵌套 diagnostics 写入既有 `step_timing.json/csv/md`，不加入 TPS attributed phase，另输出三个残差和调用次数；
+- `DS_PROBE_MODE=off|low_overhead|exact` 控制关闭、host-wall 低扰动和 CUDA-boundary 精确模式；通用 DeepSpeed runner 默认 `off`，避免历史 benchmark 行为被静默改变；
+- `run_deepspeed_full_ft_probe.sh` 强制 `--mode full`，拒绝用户覆盖为 LoRA/both，默认 exact、OMP=96、35 steps/warmup 5，并允许环境变量做 A/B；
+- session config、控制台和 summary 记录 probe mode 与 OMP，避免 optimizer 线程配置再次缺失。
+
+验证边界：`py_compile`、两个 Bash 的 `bash -n`、合成四层调用链/调用次数/残差/三种输出检查和 Full-only dry-run 已通过；没有启动 Qwen3-30B-A3B Full-FT，也没有产生新的 TPS、backward 或 CPUAdam 实测。`exact` 的 CUDA 同步会影响异步重叠，必须用同配置 `off` 或 `low_overhead` 伴随运行评估扰动。
