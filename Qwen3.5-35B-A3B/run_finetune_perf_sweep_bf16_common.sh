@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared Qwen3.5-35B-A3B native-BF16 full-FT sequence sweep.
+# Shared Qwen3.5-35B-A3B text-only native-BF16 full-FT sequence sweep.
 # Invoke through one of the three backend-specific wrapper scripts.
 
 set -Eeuo pipefail
@@ -14,14 +14,13 @@ LLAMA_FACTORY_DIR="${FFT_LLAMA_FACTORY_DIR:-/mnt/data2/wbw/LLaMA-Factory}"
 MODEL_PATH="${FFT_MODEL_PATH:-/mnt/data3/models/Qwen3.5-35B-A3B}"
 DATASET_DIR="${FFT_DATASET_DIR:-${FFT_ROOT}/dataset}"
 DATASET_NAME="${FFT_DATASET_NAME:-fft_real_100}"
-TIMING_MODULE_DIR="${FFT_ROOT}/Qwen3-30B-A3B"
 TRAIN_ENTRY_MODULE="finetune_train_with_timing"
 TRAIN_CONFIG_BASE="${CONFIGS_DIR}/train_full_bf16_qwen35.yaml"
 DEEPSPEED_CONFIG="${CONFIGS_DIR}/deepspeed_zero3_offload_bf16.json"
 VALIDATOR="${SCRIPT_DIR}/validate_benchmark_dataset.py"
 AGGREGATOR="${SCRIPT_DIR}/aggregate_sweep_results.py"
-MONITOR_SCRIPT="${SCRIPT_DIR}/monitor.py"
-RESOURCE_PROBE="${SCRIPT_DIR}/resource_scope_probe.py"
+TIMING_VALIDATOR="${SCRIPT_DIR}/validate_step_timing.py"
+RESOURCE_EXEC="${SCRIPT_DIR}/resource_scope_exec.py"
 
 if [[ $# -lt 1 ]]; then
     echo "Internal error: backend argument is required" >&2
@@ -45,9 +44,7 @@ DRY_RUN=0
 CONTINUE_ON_ERROR=0
 KEEP_MODEL_OUTPUT=0
 SKIP_DATASET_CHECK=0
-ENABLE_MONITOR=1
-MONITOR_INTERVAL="2"
-DS_PROBE_MODE="${DS_PROBE_MODE:-off}"
+CPU_THREADS_OVERRIDE="${FFT_CPU_THREADS:-}"
 
 # Consumer resource contract: an aggregate 1 TiB cgroup hard limit, no swap,
 # and equal interleaving across the two 1-TiB NUMA nodes. The interleave policy
@@ -60,9 +57,6 @@ CONSUMER_CGROUP_MODE="${FFT_CONSUMER_CGROUP_MODE:-auto}"
 APTMOE_ENTRYPOINT="${FFT_APTMOE_ENTRYPOINT:-}"
 APTMOE_PYTHON="${FFT_APTMOE_PYTHON:-}"
 
-MONITOR_PID=""
-MONITOR_FIFO=""
-MONITOR_FD=""
 RUN_ROOT=""
 
 usage() {
@@ -80,6 +74,7 @@ Sweep and training (full fine-tuning, BF16 only):
   --warmup-steps N             Initial steps excluded from stable TPS (default: 5)
   --gas N                      Gradient accumulation steps (default: 1)
   --learning-rate VALUE        Learning rate (default: 1.0e-5)
+  --cpu-threads N              CPU threads per training rank; default: physical cores / ranks
   --devices LIST               Physical GPU list; each profile uses its first N entries
   --model-path PATH            Default: /mnt/data3/models/Qwen3.5-35B-A3B
   --dataset-dir PATH           LLaMA-Factory dataset directory
@@ -91,18 +86,19 @@ Consumer memory policy:
   --consumer-numa-nodes LIST   Equal-interleave nodes (default: 0,1)
 
 APTMoE adapter (aptmoe wrapper only):
-  --aptmoe-entrypoint PATH     Qwen3.5 full-FT adapter implementing the documented CLI
+  --aptmoe-entrypoint PATH     Qwen3.5 text-only full-FT adapter implementing the documented CLI
   --aptmoe-python PATH         Python from the APTMoE runtime environment
 
 Other:
   --continue-on-error          Continue remaining sequence lengths after a failed run
   --keep-model-output          Keep generated final model output (large)
   --skip-dataset-check         Skip tokenizer length validation
-  --no-monitor                 Disable CPU/disk/GPU utilization CSV collection
-  --monitor-interval SEC       Monitor sample interval (default: 2)
   --dry-run                    Generate configs/commands without training
   -h, --help                   Show this help
 
+Timing records only per-step forward, backward, optimizer, and total wall time.
+Backend-internal profilers, forced CUDA synchronization, and resource samplers are disabled.
+The multimodal source checkpoint is loaded as Qwen3_5MoeForCausalLM; no visual tower is constructed.
 TPS = GPUs * per-device batch * sequence length * GAS / post-warmup mean step time.
 EOF
 }
@@ -123,6 +119,7 @@ while [[ $# -gt 0 ]]; do
         --warmup-steps) need_value "$1" "$#"; WARMUP_STEPS="$2"; shift ;;
         --gas) need_value "$1" "$#"; GRAD_ACCUM_STEPS="$2"; shift ;;
         --learning-rate) need_value "$1" "$#"; LEARNING_RATE="$2"; shift ;;
+        --cpu-threads) need_value "$1" "$#"; CPU_THREADS_OVERRIDE="$2"; shift ;;
         --devices) need_value "$1" "$#"; DEVICES_OVERRIDE="$2"; shift ;;
         --model-path) need_value "$1" "$#"; MODEL_PATH="$2"; shift ;;
         --dataset-dir) need_value "$1" "$#"; DATASET_DIR="$2"; shift ;;
@@ -132,11 +129,9 @@ while [[ $# -gt 0 ]]; do
         --consumer-numa-nodes) need_value "$1" "$#"; CONSUMER_NUMA_NODES="$2"; shift ;;
         --aptmoe-entrypoint) need_value "$1" "$#"; APTMOE_ENTRYPOINT="$2"; shift ;;
         --aptmoe-python) need_value "$1" "$#"; APTMOE_PYTHON="$2"; shift ;;
-        --monitor-interval) need_value "$1" "$#"; MONITOR_INTERVAL="$2"; shift ;;
         --continue-on-error) CONTINUE_ON_ERROR=1 ;;
         --keep-model-output) KEEP_MODEL_OUTPUT=1 ;;
         --skip-dataset-check) SKIP_DATASET_CHECK=1 ;;
-        --no-monitor) ENABLE_MONITOR=0 ;;
         --dry-run) DRY_RUN=1 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -170,12 +165,13 @@ require_positive_int "--steps" "${STEPS}"
 require_nonnegative_int "--warmup-steps" "${WARMUP_STEPS}"
 require_positive_int "--gas" "${GRAD_ACCUM_STEPS}"
 require_positive_number "--learning-rate" "${LEARNING_RATE}"
-require_positive_number "--monitor-interval" "${MONITOR_INTERVAL}"
+if [[ -n "${CPU_THREADS_OVERRIDE}" ]]; then
+    require_positive_int "--cpu-threads/FFT_CPU_THREADS" "${CPU_THREADS_OVERRIDE}"
+fi
 (( WARMUP_STEPS < STEPS )) || die "--warmup-steps must be smaller than --steps"
 [[ "${PROFILE}" =~ ^(server|consumer|both)$ ]] || die "invalid --profile: ${PROFILE}"
 [[ "${CONSUMER_CGROUP_MODE}" =~ ^(auto|user|system|prelimited)$ ]] || \
     die "invalid --consumer-cgroup-mode: ${CONSUMER_CGROUP_MODE}"
-[[ "${DS_PROBE_MODE}" =~ ^(off|low_overhead|exact)$ ]] || die "invalid DS_PROBE_MODE=${DS_PROBE_MODE}"
 
 IFS=',' read -r -a SEQUENCE_LENGTHS <<< "${SEQUENCE_LENGTHS_CSV// /}"
 (( ${#SEQUENCE_LENGTHS[@]} > 0 )) || die "--seq-lengths cannot be empty"
@@ -256,8 +252,9 @@ check_files_and_environment() {
     [[ -d "${DATASET_DIR}" ]] || die "dataset directory not found: ${DATASET_DIR}"
     [[ -d "${LLAMA_FACTORY_DIR}/src/llamafactory" ]] || die "LLaMA-Factory source not found: ${LLAMA_FACTORY_DIR}"
     [[ -f "${TRAIN_CONFIG_BASE}" ]] || die "training template not found: ${TRAIN_CONFIG_BASE}"
-    [[ -f "${TIMING_MODULE_DIR}/step_timing_probe.py" ]] || die "shared timing probe not found"
-    [[ -f "${VALIDATOR}" && -f "${AGGREGATOR}" && -f "${RESOURCE_PROBE}" ]] || \
+    [[ -f "${SCRIPT_DIR}/step_phase_timer.py" ]] || die "coarse step phase timer not found"
+    [[ -f "${SCRIPT_DIR}/qwen35_text_only.py" ]] || die "text-only model loader not found"
+    [[ -f "${VALIDATOR}" && -f "${AGGREGATOR}" && -f "${TIMING_VALIDATOR}" && -f "${RESOURCE_EXEC}" ]] || \
         die "benchmark helper scripts are missing"
 
     case "${BACKEND}" in
@@ -291,7 +288,7 @@ validate_dataset() {
         warn "Dataset tokenizer validation skipped by request"
         return
     fi
-    log "Validating BF16 model and dataset lengths with the Qwen3.5 tokenizer"
+    log "Validating the Qwen3.5 text-only BF16 model contract and dataset lengths"
     "${VALIDATOR_PYTHON}" "${VALIDATOR}" \
         --model-path "${MODEL_PATH}" \
         --dataset-dir "${DATASET_DIR}" \
@@ -431,6 +428,13 @@ profile_parameters() {
     esac
     (( GLOBAL_BATCH_SIZE % NUM_GPUS == 0 )) || die "global batch is not divisible by GPUs"
     PER_DEVICE_BATCH_SIZE=$((GLOBAL_BATCH_SIZE / NUM_GPUS))
+    if [[ -n "${CPU_THREADS_OVERRIDE}" ]]; then
+        CPU_THREADS_PER_RANK="${CPU_THREADS_OVERRIDE}"
+    else
+        CPU_THREADS_PER_RANK=$((PHYSICAL_CORES / NUM_GPUS))
+        (( CPU_THREADS_PER_RANK > 0 )) || CPU_THREADS_PER_RANK=1
+    fi
+    CPU_THREAD_BUDGET_TOTAL=$((CPU_THREADS_PER_RANK * NUM_GPUS))
 }
 
 set_yaml_value() {
@@ -449,6 +453,7 @@ make_train_config() {
     set_yaml_value "${config}" model_name_or_path "${MODEL_PATH}"
     set_yaml_value "${config}" dataset "${DATASET_NAME}"
     set_yaml_value "${config}" dataset_dir "${DATASET_DIR}"
+    set_yaml_value "${config}" template "qwen3"
     set_yaml_value "${config}" cutoff_len "${seq}"
     set_yaml_value "${config}" output_dir "${run_dir}/model_output"
     set_yaml_value "${config}" per_device_train_batch_size "${PER_DEVICE_BATCH_SIZE}"
@@ -476,7 +481,8 @@ write_run_config() {
         "${GLOBAL_BATCH_SIZE}" "${PER_DEVICE_BATCH_SIZE}" "${GRAD_ACCUM_STEPS}" \
         "${tokens}" "${STEPS}" "${WARMUP_STEPS}" "${LEARNING_RATE}" \
         "${devices}" "${MODEL_PATH}" "${DATASET_NAME}" "${MEMORY_LIMIT_LABEL}" \
-        "${NUMA_POLICY_LABEL}" "${RESOURCE_MODE}" "${DRY_RUN}" <<'PY'
+        "${NUMA_POLICY_LABEL}" "${RESOURCE_MODE}" "${CPU_THREADS_PER_RANK}" \
+        "${CPU_THREAD_BUDGET_TOTAL}" "${DRY_RUN}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -486,6 +492,10 @@ obj = {
     "backend": sys.argv[2],
     "profile": sys.argv[3],
     "precision": "bf16",
+    "modality": "text_only",
+    "source_architecture": "Qwen3_5MoeForConditionalGeneration",
+    "model_load_architecture": "Qwen3_5MoeForCausalLM",
+    "processor_loaded": False,
     "sequence_length": int(sys.argv[4]),
     "num_gpus": int(sys.argv[5]),
     "global_batch_size": int(sys.argv[6]),
@@ -501,7 +511,9 @@ obj = {
     "memory_limit": sys.argv[16],
     "numa_policy": sys.argv[17],
     "resource_mode": sys.argv[18],
-    "dry_run": bool(int(sys.argv[19])),
+    "cpu_threads_per_rank": int(sys.argv[19]),
+    "cpu_thread_budget_total": int(sys.argv[20]),
+    "dry_run": bool(int(sys.argv[21])),
 }
 out.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 PY
@@ -513,61 +525,6 @@ print_command() {
     printf '\n'
 }
 
-start_monitor() {
-    local profile_dir="$1"
-    [[ "${DRY_RUN}" -eq 0 && "${ENABLE_MONITOR}" -eq 1 ]] || return
-    if ! "${VALIDATOR_PYTHON}" -c 'import psutil' >/dev/null 2>&1; then
-        warn "psutil is unavailable; system monitoring disabled"
-        return
-    fi
-    MONITOR_FIFO="/tmp/qwen35_bf16_sweep_$$_$(basename "${profile_dir}").fifo"
-    [[ -e "${MONITOR_FIFO}" ]] && rm -f "${MONITOR_FIFO}"
-    mkfifo "${MONITOR_FIFO}"
-    "${VALIDATOR_PYTHON}" "${MONITOR_SCRIPT}" \
-        --out "${profile_dir}/monitor.csv" \
-        --fifo "${MONITOR_FIFO}" \
-        --interval "${MONITOR_INTERVAL}" \
-        --disk-mount /mnt/data3 \
-        > "${profile_dir}/monitor.log" 2>&1 &
-    MONITOR_PID=$!
-    sleep 1
-    if ! kill -0 "${MONITOR_PID}" 2>/dev/null; then
-        wait "${MONITOR_PID}" 2>/dev/null || true
-        warn "System monitor exited during startup; see ${profile_dir}/monitor.log"
-        MONITOR_PID=""
-        rm -f "${MONITOR_FIFO}"
-        MONITOR_FIFO=""
-        return
-    fi
-    exec {MONITOR_FD}>"${MONITOR_FIFO}"
-    log "System monitor started (PID=${MONITOR_PID})"
-}
-
-send_monitor_event() {
-    local event="$1"
-    [[ -n "${MONITOR_FD}" ]] || return
-    printf '%s\n' "${event}" >&"${MONITOR_FD}" 2>/dev/null || true
-}
-
-stop_monitor() {
-    if [[ -n "${MONITOR_FD}" ]]; then
-        exec {MONITOR_FD}>&-
-        MONITOR_FD=""
-    fi
-    if [[ -n "${MONITOR_PID}" ]] && kill -0 "${MONITOR_PID}" 2>/dev/null; then
-        kill -TERM "${MONITOR_PID}" 2>/dev/null || true
-        wait "${MONITOR_PID}" 2>/dev/null || true
-    fi
-    MONITOR_PID=""
-    [[ -n "${MONITOR_FIFO}" && -p "${MONITOR_FIFO}" ]] && rm -f "${MONITOR_FIFO}"
-    MONITOR_FIFO=""
-}
-
-cleanup() {
-    stop_monitor
-}
-trap cleanup EXIT INT TERM
-
 run_one_sequence() {
     local profile_name="$1" profile_dir="$2" seq="$3" devices="$4"
     local run_dir="${profile_dir}/seq_${seq}"
@@ -577,8 +534,7 @@ run_one_sequence() {
     local train_config=""
     local accel_config=""
     local run_cwd="${LLAMA_FACTORY_DIR}"
-    local omp_threads=$((PHYSICAL_CORES / NUM_GPUS))
-    (( omp_threads > 0 )) || omp_threads=1
+    local cpu_threads="${CPU_THREADS_PER_RANK}"
     mkdir -p "${timing_dir}"
     write_run_config "${run_dir}/run_config.json" "${profile_name}" "${seq}" "${devices}" "${tokens_per_step}"
 
@@ -586,9 +542,13 @@ run_one_sequence() {
     case "${BACKEND}" in
         ktransformers)
             train_config="$(make_train_config "${run_dir}" "${seq}")"
-            accel_config="${CONFIGS_DIR}/accelerate_ktransformers_bf16_${NUM_GPUS}gpu.yaml"
-            [[ -f "${accel_config}" ]] || die "accelerate config not found: ${accel_config}"
-            omp_threads="${FFT_OMP_NUM_THREADS:-${PHYSICAL_CORES}}"
+            local accel_template="${CONFIGS_DIR}/accelerate_ktransformers_bf16_${NUM_GPUS}gpu.yaml"
+            [[ -f "${accel_template}" ]] || die "accelerate config not found: ${accel_template}"
+            grep -q '^  kt_num_threads:' "${accel_template}" || \
+                die "kt_num_threads is missing from ${accel_template}"
+            accel_config="${run_dir}/accelerate_config.yaml"
+            cp "${accel_template}" "${accel_config}"
+            sed -i "s|^  kt_num_threads:.*|  kt_num_threads: ${cpu_threads}|" "${accel_config}"
             local accelerate_bin="${CONDA_BIN_DIR}/accelerate"
             [[ -x "${accelerate_bin}" ]] || accelerate_bin="accelerate"
             command=(
@@ -599,20 +559,30 @@ run_one_sequence() {
                 KT_FINETUNE_MODE=full
                 FFT_TRAINING_BACKEND=kt
                 FFT_PRECISION=bf16
+                FFT_TEXT_ONLY=1
                 FFT_SKIP_FINAL_SAVE="$((1 - KEEP_MODEL_OUTPUT))"
-                KT_STEP_TIMING=1
-                KT_STEP_TIMING_OUT_DIR="${timing_dir}"
-                KT_STEP_TIMING_WARMUP_SKIP="${WARMUP_STEPS}"
-                KT_STEP_TIMING_TOKENS_PER_STEP="${tokens_per_step}"
+                FFT_STEP_TIMING_OUT_DIR="${timing_dir}"
+                FFT_STEP_TIMING_WARMUP_STEPS="${WARMUP_STEPS}"
+                FFT_STEP_TIMING_TOKENS_PER_STEP="${tokens_per_step}"
+                FFT_DISABLE_PERF_PROBES=1
+                FFT_CPU_THREADS="${cpu_threads}"
                 KT_BACKWARD_TIMING=off
+                KT_SFT_PROFILE=0
+                DS_PROBE_MODE=off
                 ACCELERATE_KT_MODEL_MAX_LENGTH="${seq}"
-                OMP_NUM_THREADS="${omp_threads}"
-                ACCELERATE_KT_OMP_NUM_THREADS="${omp_threads}"
+                OMP_NUM_THREADS="${cpu_threads}"
+                MKL_NUM_THREADS="${cpu_threads}"
+                OPENBLAS_NUM_THREADS="${cpu_threads}"
+                NUMEXPR_NUM_THREADS="${cpu_threads}"
+                BLIS_NUM_THREADS="${cpu_threads}"
+                OMP_DYNAMIC=FALSE
+                MKL_DYNAMIC=FALSE
+                ACCELERATE_KT_OMP_NUM_THREADS="${cpu_threads}"
                 TOKENIZERS_PARALLELISM=false
                 HF_DATASETS_OFFLINE=1
                 TRANSFORMERS_OFFLINE=1
                 CUDA_VISIBLE_DEVICES="${devices}"
-                PYTHONPATH="${SCRIPT_DIR}:${TIMING_MODULE_DIR}:${LLAMA_FACTORY_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
+                PYTHONPATH="${SCRIPT_DIR}:${LLAMA_FACTORY_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
                 "${accelerate_bin}" launch
                 --config_file "${accel_config}"
                 -m "${TRAIN_ENTRY_MODULE}" train "${train_config}"
@@ -622,26 +592,35 @@ run_one_sequence() {
             train_config="$(make_train_config "${run_dir}" "${seq}")"
             local torchrun_bin="${CONDA_BIN_DIR}/torchrun"
             [[ -x "${torchrun_bin}" ]] || torchrun_bin="torchrun"
-            omp_threads="${FFT_DS_OMP_NUM_THREADS:-${omp_threads}}"
             command=(
                 env
                 USE_KT=0
                 ACCELERATE_USE_KT=false
                 FFT_TRAINING_BACKEND=deepspeed
                 FFT_PRECISION=bf16
+                FFT_TEXT_ONLY=1
                 FFT_SKIP_FINAL_SAVE="$((1 - KEEP_MODEL_OUTPUT))"
                 KT_FINETUNE_MODE=full
-                KT_STEP_TIMING=1
-                KT_STEP_TIMING_OUT_DIR="${timing_dir}"
-                KT_STEP_TIMING_WARMUP_SKIP="${WARMUP_STEPS}"
-                KT_STEP_TIMING_TOKENS_PER_STEP="${tokens_per_step}"
-                DS_PROBE_MODE="${DS_PROBE_MODE}"
-                OMP_NUM_THREADS="${omp_threads}"
+                FFT_STEP_TIMING_OUT_DIR="${timing_dir}"
+                FFT_STEP_TIMING_WARMUP_STEPS="${WARMUP_STEPS}"
+                FFT_STEP_TIMING_TOKENS_PER_STEP="${tokens_per_step}"
+                FFT_DISABLE_PERF_PROBES=1
+                FFT_CPU_THREADS="${cpu_threads}"
+                KT_BACKWARD_TIMING=off
+                KT_SFT_PROFILE=0
+                DS_PROBE_MODE=off
+                OMP_NUM_THREADS="${cpu_threads}"
+                MKL_NUM_THREADS="${cpu_threads}"
+                OPENBLAS_NUM_THREADS="${cpu_threads}"
+                NUMEXPR_NUM_THREADS="${cpu_threads}"
+                BLIS_NUM_THREADS="${cpu_threads}"
+                OMP_DYNAMIC=FALSE
+                MKL_DYNAMIC=FALSE
                 TOKENIZERS_PARALLELISM=false
                 HF_DATASETS_OFFLINE=1
                 TRANSFORMERS_OFFLINE=1
                 CUDA_VISIBLE_DEVICES="${devices}"
-                PYTHONPATH="${SCRIPT_DIR}:${TIMING_MODULE_DIR}:${LLAMA_FACTORY_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
+                PYTHONPATH="${SCRIPT_DIR}:${LLAMA_FACTORY_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
                 "${torchrun_bin}" --standalone --nproc_per_node="${NUM_GPUS}"
                 -m "${TRAIN_ENTRY_MODULE}" train "${train_config}"
             )
@@ -652,8 +631,20 @@ run_one_sequence() {
                 env
                 FFT_TRAINING_BACKEND=aptmoe
                 FFT_PRECISION=bf16
+                FFT_TEXT_ONLY=1
                 FFT_SKIP_FINAL_SAVE="$((1 - KEEP_MODEL_OUTPUT))"
-                OMP_NUM_THREADS="${FFT_APTMOE_OMP_NUM_THREADS:-${omp_threads}}"
+                FFT_DISABLE_PERF_PROBES=1
+                FFT_CPU_THREADS="${cpu_threads}"
+                KT_BACKWARD_TIMING=off
+                KT_SFT_PROFILE=0
+                DS_PROBE_MODE=off
+                OMP_NUM_THREADS="${cpu_threads}"
+                MKL_NUM_THREADS="${cpu_threads}"
+                OPENBLAS_NUM_THREADS="${cpu_threads}"
+                NUMEXPR_NUM_THREADS="${cpu_threads}"
+                BLIS_NUM_THREADS="${cpu_threads}"
+                OMP_DYNAMIC=FALSE
+                MKL_DYNAMIC=FALSE
                 TOKENIZERS_PARALLELISM=false
                 HF_DATASETS_OFFLINE=1
                 TRANSFORMERS_OFFLINE=1
@@ -673,28 +664,26 @@ run_one_sequence() {
                 --warmup-steps "${WARMUP_STEPS}"
                 --learning-rate "${LEARNING_RATE}"
                 --precision bf16
+                --text-only
             )
             ;;
     esac
 
-    local -a probe_command=(
-        "${VALIDATOR_PYTHON}" "${RESOURCE_PROBE}"
+    local -a scoped_command=(
+        "${VALIDATOR_PYTHON}" "${RESOURCE_EXEC}"
         --profile "${profile_name}"
         --numa-nodes "${CONSUMER_NUMA_NODES}"
         --output-dir "${run_dir}"
-        --interval "${MONITOR_INTERVAL}"
     )
     if [[ "${profile_name}" == "consumer" ]]; then
-        probe_command+=(
+        scoped_command+=(
             --expected-memory-max "${CONSUMER_MEMORY_LIMIT_BYTES}"
             --require-swap-zero
         )
     fi
-    probe_command+=(-- "${command[@]}")
-    local -a full_command=("${RESOURCE_PREFIX[@]}" "${probe_command[@]}")
-    log "${BACKEND}/${profile_name}: seq=${seq}, GPUs=${NUM_GPUS}, global_batch=${GLOBAL_BATCH_SIZE}, tokens/step=${tokens_per_step}, BF16, OMP=${omp_threads}"
-    send_monitor_event "phase:seq_${seq}"
-    send_monitor_event "event:train_start"
+    scoped_command+=(-- "${command[@]}")
+    local -a full_command=("${RESOURCE_PREFIX[@]}" "${scoped_command[@]}")
+    log "${BACKEND}/${profile_name}: seq=${seq}, GPUs=${NUM_GPUS}, global_batch=${GLOBAL_BATCH_SIZE}, tokens/step=${tokens_per_step}, text-only BF16, CPU threads/rank=${cpu_threads}"
 
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         print_command "${full_command[@]}"
@@ -709,11 +698,18 @@ run_one_sequence() {
     exit_code=${PIPESTATUS[0]}
     set -e
     popd >/dev/null
-    send_monitor_event "event:train_end"
 
-    if [[ "${exit_code}" -eq 0 && ! -f "${timing_dir}/step_timing.json" ]]; then
-        warn "Training exited successfully but canonical rank-0 timing is missing"
-        exit_code=90
+    if [[ "${exit_code}" -eq 0 ]]; then
+        if [[ ! -f "${timing_dir}/step_timing.json" ]]; then
+            warn "Training exited successfully but canonical rank-0 timing is missing"
+            exit_code=90
+        elif ! "${VALIDATOR_PYTHON}" "${TIMING_VALIDATOR}" \
+            --path "${timing_dir}/step_timing.json" \
+            --expected-steps "${STEPS}" \
+            --warmup-steps "${WARMUP_STEPS}"; then
+            warn "Timing output violates the probe-free three-phase contract"
+            exit_code=92
+        fi
     fi
     printf '%s\n' "${exit_code}" > "${run_dir}/exit_code.txt"
 
@@ -737,8 +733,7 @@ run_profile() {
     build_resource_policy "${profile_name}"
     local profile_dir="${RUN_ROOT}/${profile_name}_${NUM_GPUS}gpu_batch${GLOBAL_BATCH_SIZE}"
     mkdir -p "${profile_dir}"
-    log "Profile ${profile_name}: devices=${devices}, memory=${MEMORY_LIMIT_LABEL}, NUMA=${NUMA_POLICY_LABEL}"
-    start_monitor "${profile_dir}"
+    log "Profile ${profile_name}: devices=${devices}, memory=${MEMORY_LIMIT_LABEL}, NUMA=${NUMA_POLICY_LABEL}, CPU threads/rank=${CPU_THREADS_PER_RANK}"
 
     local profile_status=0 seq
     for seq in "${SEQUENCE_LENGTHS[@]}"; do
@@ -750,7 +745,6 @@ run_profile() {
             fi
         fi
     done
-    stop_monitor
     return "${profile_status}"
 }
 
@@ -760,7 +754,7 @@ RUN_ROOT="${LOG_BASE}/${RUN_TIMESTAMP}_${BACKEND^^}_BF16_FULL_SWEEP"
 mkdir -p "${RUN_ROOT}"
 validate_dataset
 
-log "Qwen3.5-35B-A3B full-FT sweep: backend=${BACKEND}, precision=BF16, profile=${PROFILE}"
+log "Qwen3.5-35B-A3B text-only full-FT sweep: backend=${BACKEND}, precision=BF16, profile=${PROFILE}"
 log "Sequences: ${SEQUENCE_LENGTHS[*]}; steps=${STEPS}; warmup excluded=${WARMUP_STEPS}; GAS=${GRAD_ACCUM_STEPS}"
 log "Result root: ${RUN_ROOT}"
 

@@ -1,42 +1,34 @@
-"""LLaMA-Factory entrypoint with low-overhead, rank-safe step timing.
-
-The timing implementation is shared with the Qwen3 benchmark. Rank 0 writes
-the canonical ``step_timing`` files used for TPS; other ranks write sibling
-``.rankN`` directories so concurrent callbacks cannot overwrite rank 0.
-"""
+"""LLaMA-Factory entrypoint with minimal, rank-safe step phase timing."""
 
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
 
 
 def _install_timing() -> None:
     precision = os.environ.get("FFT_PRECISION", "bf16").strip().lower()
     if precision not in {"bf16", "bfloat16"}:
         raise RuntimeError(f"This benchmark is BF16-only, got FFT_PRECISION={precision!r}")
+    if os.environ.get("FFT_DISABLE_PERF_PROBES", "0").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        raise RuntimeError("FFT_DISABLE_PERF_PROBES=1 is required for this benchmark")
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
     if world_size > 1 and rank != 0:
-        base = os.environ.get("KT_STEP_TIMING_OUT_DIR", "step_timing_out")
-        os.environ["KT_STEP_TIMING_OUT_DIR"] = f"{base}.rank{rank}"
+        base = os.environ.get("FFT_STEP_TIMING_OUT_DIR", "step_timing_out")
+        os.environ["FFT_STEP_TIMING_OUT_DIR"] = f"{base}.rank{rank}"
 
-    fft_root = Path(__file__).resolve().parent.parent
-    timing_module_dir = fft_root / "Qwen3-30B-A3B"
-    if not (timing_module_dir / "step_timing_probe.py").is_file():
-        raise FileNotFoundError(
-            f"Shared timing probe is missing: {timing_module_dir / 'step_timing_probe.py'}"
-        )
-    sys.path.insert(0, str(timing_module_dir))
+    from step_phase_timer import install_step_phase_timing
 
-    import step_timing_probe
-
-    step_timing_probe.install_step_timing()
+    install_step_phase_timing()
     print(
         f"[qwen35_bf16_timing] rank={rank}/{world_size} "
-        f"out={os.environ.get('KT_STEP_TIMING_OUT_DIR')}",
+        f"out={os.environ.get('FFT_STEP_TIMING_OUT_DIR')}",
         flush=True,
     )
 
@@ -67,6 +59,9 @@ def _disable_benchmark_saves() -> None:
 def main() -> None:
     _install_timing()
     _disable_benchmark_saves()
+    from qwen35_text_only import install_text_only_loading
+
+    install_text_only_loading()
     from llamafactory.cli import main as llamafactory_main
 
     llamafactory_main()

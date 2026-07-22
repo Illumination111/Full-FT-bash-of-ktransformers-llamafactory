@@ -1,4 +1,4 @@
-# Qwen3.5-35B-A3B full fine-tuning benchmark template (native BF16).
+# Qwen3.5-35B-A3B text-only full fine-tuning benchmark template (native BF16).
 #
 # The sweep runner copies this file for every sequence length and replaces the
 # model, dataset, cutoff, batch, step, backend, and output settings. Generated
@@ -7,8 +7,9 @@
 ### model
 model_name_or_path: /mnt/data3/models/Qwen3.5-35B-A3B
 trust_remote_code: true
-freeze_vision_tower: true
-freeze_multi_modal_projector: true
+# The benchmark entrypoint extracts text_config and constructs
+# Qwen3_5MoeForCausalLM. The visual tower is never constructed; freezing it is
+# insufficient because a frozen tower still contains Conv3d modules.
 
 ### method
 stage: sft
@@ -18,7 +19,7 @@ finetuning_type: full
 ### dataset
 dataset: fft_real_100
 dataset_dir: /mnt/data2/wbw/FFTtest/dataset
-template: qwen3_5
+template: qwen3
 cutoff_len: 4096
 max_samples: 100
 packing: false
@@ -32,6 +33,8 @@ dataloader_pin_memory: true
 ### output
 output_dir: /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/test_log/PLACEHOLDER
 logging_steps: 1
+logging_strategy: "no"
+disable_tqdm: true
 save_strategy: "no"
 plot_loss: false
 overwrite_output_dir: true
