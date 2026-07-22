@@ -559,8 +559,14 @@ run_train() {
     send_event "phase:${phase_name}"
     send_event "event:train_start"
 
+    # Prefer an externally set CUDA_VISIBLE_DEVICES (e.g. GPU 7 via
+    # CUDA_VISIBLE_DEVICES=7); otherwise use the first NUM_GPUS devices.
     local gpus_str
-    gpus_str=$(seq 0 $((NUM_GPUS - 1)) | paste -sd ',')
+    if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+        gpus_str="${CUDA_VISIBLE_DEVICES}"
+    else
+        gpus_str=$(seq 0 $((NUM_GPUS - 1)) | paste -sd ',')
+    fi
 
     local accelerate_bin="${CONDA_BIN_DIR}/accelerate"
     [[ ! -x "${accelerate_bin}" ]] && accelerate_bin="accelerate"

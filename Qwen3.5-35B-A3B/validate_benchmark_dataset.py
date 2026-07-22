@@ -27,9 +27,16 @@ def validate_model(model_path: Path) -> dict[str, object]:
         raise FileNotFoundError(f"Model config is missing: {config_path}")
     config = json.loads(config_path.read_text(encoding="utf-8"))
     architectures = config.get("architectures") or []
-    if "Qwen3_5MoeForConditionalGeneration" not in architectures:
+    source_architecture = "Qwen3_5MoeForConditionalGeneration"
+    text_architecture = "Qwen3_5MoeForCausalLM"
+    if source_architecture not in architectures:
         raise ValueError(f"Expected Qwen3.5-35B-A3B MoE architecture, got {architectures}")
     text_config = config.get("text_config") or {}
+    if text_config.get("model_type") != "qwen3_5_moe_text":
+        raise ValueError(
+            "Expected qwen3_5_moe_text in the multimodal checkpoint's text_config, "
+            f"got {text_config.get('model_type')!r}"
+        )
     dtype = str(text_config.get("dtype", text_config.get("torch_dtype", ""))).lower()
     if dtype not in {"bfloat16", "bf16"}:
         raise ValueError(f"Model is not declared BF16: text_config dtype={dtype!r}")
@@ -38,15 +45,67 @@ def validate_model(model_path: Path) -> dict[str, object]:
     if not index_path.is_file():
         raise FileNotFoundError(f"Safetensors index is missing: {index_path}")
     index = json.loads(index_path.read_text(encoding="utf-8"))
-    shards = sorted(set((index.get("weight_map") or {}).values()))
+    weight_map = index.get("weight_map") or {}
+    shards = sorted(set(weight_map.values()))
     missing = [name for name in shards if not (model_path / name).is_file()]
     if missing:
         raise FileNotFoundError(f"Missing {len(missing)} model shards: {missing[:3]}")
+    text_weight_keys = sum(
+        key.startswith("model.language_model.") or key.startswith("lm_head.") for key in weight_map
+    )
+    visual_weight_keys = sum(key.startswith("model.visual.") for key in weight_map)
+    mtp_weight_keys = sum(key.startswith("mtp.") for key in weight_map)
+    if text_weight_keys == 0 or visual_weight_keys == 0:
+        raise ValueError(
+            "Expected a multimodal checkpoint containing both language and visual weights; "
+            f"found language={text_weight_keys}, visual={visual_weight_keys}"
+        )
+
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    source_config = AutoConfig.from_pretrained(
+        str(model_path), trust_remote_code=True, local_files_only=True
+    )
+    runtime_text_config = source_config.text_config
+    runtime_text_config.architectures = [text_architecture]
+    mapped_class = AutoModelForCausalLM._model_mapping[type(runtime_text_config)].__name__
+    if mapped_class != text_architecture:
+        raise ValueError(
+            f"Transformers cannot map the text_config to {text_architecture}; got {mapped_class}"
+        )
     return {
-        "architecture": architectures[0],
+        "source_architecture": architectures[0],
+        "source_model_type": config.get("model_type"),
+        "load_architecture": text_architecture,
+        "load_model_type": text_config.get("model_type"),
+        "modality": "text_only",
         "dtype": "bfloat16",
         "model_shards": len(shards),
+        "language_weight_keys": text_weight_keys,
+        "excluded_visual_weight_keys": visual_weight_keys,
+        "excluded_mtp_weight_keys": mtp_weight_keys,
     }
+
+
+def validate_text_only_rows(rows: list[dict[str, object]]) -> None:
+    multimodal_fields = {
+        "image",
+        "images",
+        "video",
+        "videos",
+        "audio",
+        "audios",
+    }
+    invalid: list[tuple[int, list[str]]] = []
+    for index, row in enumerate(rows):
+        fields = sorted(multimodal_fields.intersection(row))
+        if fields:
+            invalid.append((index, fields))
+    if invalid:
+        raise ValueError(
+            "Text-only benchmark dataset contains multimodal fields; "
+            f"first rows: {invalid[:5]}"
+        )
 
 
 def token_lengths(model_path: Path, rows: list[dict[str, object]]) -> list[int]:
@@ -84,6 +143,9 @@ def main() -> None:
     rows = json.loads(dataset_file.read_text(encoding="utf-8"))
     if not isinstance(rows, list) or not rows:
         raise ValueError(f"Dataset must be a non-empty JSON list: {dataset_file}")
+    if not all(isinstance(row, dict) for row in rows):
+        raise ValueError(f"Every dataset sample must be an object: {dataset_file}")
+    validate_text_only_rows(rows)
     lengths = token_lengths(args.model_path, rows)
     too_short = [i for i, length in enumerate(lengths) if length <= args.required_length]
     if too_short:

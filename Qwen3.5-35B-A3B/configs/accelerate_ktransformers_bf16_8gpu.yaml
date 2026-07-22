@@ -7,6 +7,7 @@ fsdp_config:
   fsdp_offload_params: false
   fsdp_reshard_after_forward: true
   fsdp_state_dict_type: FULL_STATE_DICT
+  fsdp_transformer_layer_cls_to_wrap: Qwen3_5MoeDecoderLayer
   fsdp_version: 2
 mixed_precision: bf16
 num_machines: 1
@@ -18,6 +19,7 @@ use_cpu: false
 kt_config:
   enabled: true
   kt_backend: AMXBF16
+  # The sweep runner copies this file and replaces the value per profile/run.
   kt_num_threads: 96
   kt_tp_enabled: true
   kt_threadpool_count: 2
