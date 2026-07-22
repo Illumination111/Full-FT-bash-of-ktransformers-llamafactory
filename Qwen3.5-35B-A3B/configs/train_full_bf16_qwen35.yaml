@@ -1,0 +1,59 @@
+# Qwen3.5-35B-A3B full fine-tuning benchmark template (native BF16).
+#
+# The sweep runner copies this file for every sequence length and replaces the
+# model, dataset, cutoff, batch, step, backend, and output settings. Generated
+# configs inside test_log/ are the benchmark source of truth.
+
+### model
+model_name_or_path: /mnt/data3/models/Qwen3.5-35B-A3B
+trust_remote_code: true
+freeze_vision_tower: true
+freeze_multi_modal_projector: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+
+### dataset
+dataset: fft_real_100
+dataset_dir: /mnt/data2/wbw/FFTtest/dataset
+template: qwen3_5
+cutoff_len: 4096
+max_samples: 100
+packing: false
+overwrite_cache: false
+preprocessing_num_workers: 16
+dataloader_num_workers: 2
+dataloader_prefetch_factor: 4
+dataloader_persistent_workers: true
+dataloader_pin_memory: true
+
+### output
+output_dir: /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/test_log/PLACEHOLDER
+logging_steps: 1
+save_strategy: "no"
+plot_loss: false
+overwrite_output_dir: true
+save_only_model: true
+report_to: none
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 1.0e-5
+max_steps: 15
+num_train_epochs: 100.0
+lr_scheduler_type: cosine
+warmup_steps: 0
+bf16: true
+fp16: false
+tf32: false
+gradient_checkpointing: true
+ddp_timeout: 360000000
+resume_from_checkpoint: null
+max_grad_norm: 1.0
+
+### backend (overridden for DeepSpeed)
+use_kt: true
+kt_weight_path: /mnt/data3/models/Qwen3.5-35B-A3B

@@ -28,7 +28,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # --------------------------------------------------------------------------- #
@@ -286,7 +286,7 @@ class Monitor:
                     time.sleep(0.5)
 
     def _sample_once(self, prev_disk: dict, dt: float) -> dict:
-        now = datetime.utcnow().isoformat(timespec="milliseconds")
+        now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
         elapsed = time.time() - self._start_time
 
         # CPU
