@@ -2,6 +2,11 @@
 **/test_log/
 test_log/
 
+# APTMoE Qwen3.5 deployment-proxy artifacts. This directory may contain
+# generated BF16 random-weight shards, route traces, lookup tables, CUDA build
+# caches, and other large local-only files.
+/APTMoE-simulate/
+
 # Python cache
 **/__pycache__/
 *.py[cod]

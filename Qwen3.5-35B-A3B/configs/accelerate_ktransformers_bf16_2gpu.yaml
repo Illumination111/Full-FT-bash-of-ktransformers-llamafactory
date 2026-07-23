@@ -20,7 +20,7 @@ kt_config:
   enabled: true
   kt_backend: AMXBF16
   # The sweep runner copies this file and replaces the value per profile/run.
-  kt_num_threads: 96
+  kt_num_threads: 92
   kt_tp_enabled: true
   kt_threadpool_count: 2
   kt_max_cache_depth: 2

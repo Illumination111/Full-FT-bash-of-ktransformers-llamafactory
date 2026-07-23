@@ -3,6 +3,44 @@
 from __future__ import annotations
 
 import os
+import sys
+
+
+def _configure_kt_rank_threads() -> None:
+    """Give the global KT owner a large CPU pool without oversubscribing peers."""
+    if os.environ.get("FFT_TRAINING_BACKEND", "").strip().lower() != "kt":
+        return
+
+    owner_text = os.environ.get("FFT_KT_OWNER_THREADS")
+    non_owner_text = os.environ.get("FFT_KT_NON_OWNER_THREADS")
+    if owner_text is None or non_owner_text is None:
+        return
+
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+    owner_threads = int(owner_text)
+    non_owner_threads = int(non_owner_text)
+    if owner_threads <= 0 or non_owner_threads <= 0:
+        raise RuntimeError(
+            "FFT_KT_OWNER_THREADS and FFT_KT_NON_OWNER_THREADS must be positive"
+        )
+
+    threads = owner_threads if rank == 0 else non_owner_threads
+    for name in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "ACCELERATE_KT_OMP_NUM_THREADS",
+        "FFT_CPU_THREADS",
+    ):
+        os.environ[name] = str(threads)
+
+    print(
+        f"[qwen35_bf16_threads] rank={rank} role={'kt_owner' if rank == 0 else 'non_owner'} "
+        f"cpu_threads={threads}",
+        flush=True,
+    )
 
 
 def _install_timing() -> None:
@@ -56,15 +94,29 @@ def _disable_benchmark_saves() -> None:
     Trainer.save_state = skip_save_state
 
 
+def _run_training_in_current_rank() -> None:
+    """Enter LLaMA-Factory without launching a second distributed job.
+
+    The sweep runner already starts this module once per rank with torchrun or
+    Accelerate.  Calling ``llamafactory.cli.main`` here would inspect all
+    visible GPUs and launch another torchrun from every existing rank.
+    """
+    if sys.argv[1:2] == ["train"]:
+        del sys.argv[1]
+
+    from llamafactory.train.tuner import run_exp
+
+    run_exp()
+
+
 def main() -> None:
+    _configure_kt_rank_threads()
     _install_timing()
     _disable_benchmark_saves()
     from qwen35_text_only import install_text_only_loading
 
     install_text_only_loading()
-    from llamafactory.cli import main as llamafactory_main
-
-    llamafactory_main()
+    _run_training_in_current_rank()
 
 
 if __name__ == "__main__":

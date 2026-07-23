@@ -1,0 +1,100 @@
+# Configuration contract implemented by ../aptmoe_qwen35_proxy_train.py.
+#
+# This is a deployment proxy, not Qwen3.5 checkpoint training and not a
+# LLaMA-Factory backend result.  The tracked adapter imports APTMoE-baseline;
+# it does not patch or overwrite that separate checkout.
+
+### proxy identity
+benchmark_class: deployment_proxy
+deployment_profile: null  # server or consumer; required
+proxy_architecture: qwen35_component_isomorphic
+proxy_target_config: /mnt/data3/models/Qwen3.5-35B-A3B/config.json
+proxy_weight_source: random
+checkpoint_compatible: false
+model_quality_metrics: false
+llamafactory_backend: false
+real_forward_backward_optimizer_update: true
+
+### exact text-model shape
+hidden_size: 2048
+num_hidden_layers: 40
+layer_pattern: [linear_attention, linear_attention, linear_attention, full_attention]
+num_attention_heads: 16
+num_key_value_heads: 2
+head_dim: 256
+attn_output_gate: true
+linear_num_key_heads: 16
+linear_num_value_heads: 32
+linear_key_head_dim: 128
+linear_value_head_dim: 128
+linear_conv_kernel_dim: 4
+num_experts: 256
+num_experts_per_tok: 8
+moe_intermediate_size: 512
+shared_expert_intermediate_size: 512
+vocab_size: 248320
+
+### placement
+token_mixer_device: cuda
+require_linear_attention_fastpath: true
+record_attention_kernel_versions: true
+router_device: cuda
+shared_expert_device: cuda
+routed_expert_home_device: cpu
+routed_expert_transfer_granularity: expert
+optimizer_home_device: cpu
+simulation_root: /mnt/data2/wbw/FFTtest/APTMoE-simulate
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+bf16: true
+fp16: false
+optim: adamw_torch
+# Match the current APTMoE baseline: torch.optim.AdamW creates BF16 exp_avg and
+# exp_avg_sq for BF16 parameters in the installed environment.  If the ideal
+# Qwen3.5 APTMoE implementation is changed to FP32 moments, change both runs.
+optimizer_state_dtype: bf16
+require_optimizer_state_dtype_audit: true
+fp32_master_weights: false
+gradient_checkpointing: true
+verify_all_parameter_groups_updated: true
+save_random_weights: false
+
+### benchmark data/protocol
+tokenizer_name_or_path: /mnt/data3/models/Qwen3.5-35B-A3B
+dataset: fft_real_100
+dataset_dir: /mnt/data2/wbw/FFTtest/dataset
+template: qwen3
+# Render one config per sequence length in [32, 64, 128, 256, 512, 1024,
+# 2048, 4096].
+cutoff_len: 2048
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 1.0e-5
+max_steps: 15
+warmup_steps: 0
+timing_warmup_steps: 5
+precision: bf16
+
+### APTMoE
+pipeline: APTMoE
+num_chunks: 1
+num_stages: 40
+# APTMoE ranks are pipeline ranks, not data-parallel replicas.  The proxy
+# runner must require this field and set it to 8 for server / 2 for consumer.
+aptmoe_global_batch_size: null
+layers_per_stage: 1
+inter_stage_only: true
+prefetch_portion: 0.6
+routing_source: replayed_exact_qwen35_topk_indices
+route_trace: null  # required for formal runs; capture with an exact backend
+lookup_table: null  # required for formal runs; profile on this host
+
+### benchmark guardrails
+disable_cuda_synchronize_in_timed_window: true
+disable_resource_sampler: true
+emit_proxy_manifest: true
+emit_step_timing: true
+allow_end_to_end_qwen35_tps_claim: false
