@@ -3,9 +3,10 @@
 这组脚本不包含 LoRA。KTransformers/DeepSpeed 测真实文本模型全量微调；
 APTMoE 测随机权重的组件同构 full-update proxy。目标配置固定为本地
 `/mnt/data3/models/Qwen3.5-35B-A3B`，训练与后端混合精度均显式设为
-BF16。默认对 `32,64,128,256,512,1024,2048,4096` 八种 sequence
-length 分别运行 15 个 optimizer steps，去除前 5 个 warmup steps 后计算
-稳定 TPS。这里的 5 步是性能统计排除窗口；训练配置的学习率 warmup 为 0。
+BF16。server 默认测试 `32,64,128,256,512,1024,2048,4096`，consumer
+默认测试 `16,32,64,128,256,512,1024,2048`。每种 sequence length 分别运行
+15 个 optimizer steps，去除前 5 个 warmup steps 后计算稳定 TPS。这里的 5 步
+是性能统计排除窗口；训练配置的学习率 warmup 为 0。
 
 ## 文本-only 模型契约
 
@@ -110,7 +111,9 @@ bash run_finetune_perf_test_bf16_ktransformers.sh --profile both --dry-run
 ```
 
 `--profile both` 按 server、consumer 顺序运行。可以通过
-`--seq-lengths 32,64` 缩小调试范围；正式对比应保留默认八档。
+`--seq-lengths 32,64` 缩小调试范围；该参数会覆盖所选 profile 的默认值，
+与 `--profile both` 一起使用时只能包含两个 profile 共有的长度。正式对比应保留
+各 profile 的默认八档。
 
 ## APTMoE deployment proxy（已实现，非等价后端）
 
@@ -200,7 +203,7 @@ export TRITON_CACHE_DIR=/mnt/data2/wbw/FFTtest/APTMoE-simulate/cache/triton
   --model-path /mnt/data3/models/Qwen3.5-35B-A3B \
   --output /mnt/data2/wbw/FFTtest/APTMoE-simulate/lookups/qwen35/consumer.json \
   --simulation-root /mnt/data2/wbw/FFTtest/APTMoE-simulate \
-  --sequence-length 128 --max-tokens 8192 --cpu-threads 48
+  --sequence-length 128 --max-tokens 4096 --cpu-threads 48
 ```
 
 lookup 覆盖 6 MiB expert H2D/D2H、CPU expert forward/backward 曲线、
@@ -216,7 +219,7 @@ runner 会在模型分配前拒绝 lookup，而不会静默 clamp。
 ```bash
 bash run_finetune_perf_test_bf16_aptmoe.sh \
   --profile consumer \
-  --seq-lengths 32 \
+  --seq-lengths 16 \
   --steps 4 --warmup-steps 2 \
   --aptmoe-allow-synthetic-routing \
   --aptmoe-allow-unprofiled-placement \

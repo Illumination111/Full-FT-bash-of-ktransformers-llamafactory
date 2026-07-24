@@ -23,7 +23,8 @@ KTransformers 与 DeepSpeed 仍使用当前 LLaMA-Factory 入口运行真实
 - 文本模型：从多模态 checkpoint 提取 `text_config`，加载
   `Qwen3_5MoeForCausalLM`，排除 vision 和 MTP；
 - 精度与训练：BF16、`finetuning_type=full`、真实 forward/backward/optimizer；
-- 序列长度：32、64、128、256、512、1024、2048、4096；
+- 序列长度：server 为 32、64、128、256、512、1024、2048、4096；
+  consumer 为 16、32、64、128、256、512、1024、2048；
 - 每档 15 个 optimizer steps，前 5 步只作性能 warmup；
 - server：8 GPU、global batch 8；consumer：2 GPU、global batch 2、1 TiB
   cgroup、无 swap、NUMA 0/1 interleave；
@@ -241,7 +242,7 @@ Qwen3-30 的 9 MiB expert 表。placement 保留原 APTMoE 的累计
 linear-attention 或 full-attention H2D 时间，并在 stage 0/39 加入 embedding 或
 final-norm/LM-head，而不是对所有层共用一个 `load_MHA`。
 曲线覆盖上限至少为该 profile 的最大 `global_batch × sequence`：server 32,768，
-consumer 8,192；否则长序列 formal run 会在分配模型前拒绝该 lookup。
+consumer 4,096；否则长序列 formal run 会在分配模型前拒绝该 lookup。
 
 ### 5. 路由输入
 
@@ -366,8 +367,8 @@ activation 和 expert staging。
 
 | profile | world size | APTMoE pipeline global batch | 序列长度 |
 |---|---:|---:|---|
-| server | 8 | 8 | 32～4096 |
-| consumer | 2 | 2 | 32～4096 |
+| server | 8 | 8 | 32、64、128、256、512、1024、2048、4096 |
+| consumer | 2 | 2 | 16、32、64、128、256、512、1024、2048 |
 
 APTMoE 的 rank 是 pipeline rank，不是数据并行 replica。公共 wrapper 已明确传入
 `--global-batch-size`，server/consumer 分别为 8/2，并强制它等于
@@ -419,7 +420,7 @@ CPU expert forward/backward、256-way router、两类 attention forward/backward
 
 1. 生成 `proxy_manifest.json`，与实际 `named_parameters()` 分类统计逐项比较；
 2. meta-device 审计总参数及组件参数；
-3. consumer 2-GPU、seq=32、2 个 warmup + 2 个 update；
+3. consumer 2-GPU、seq=16、2 个 warmup + 2 个 update；
 4. 验证 token mixer、router、shared expert、至少一个 CPU routed expert 的
    `grad != None` 且权重发生改变；
 5. seq=128 重跑，检查 OOM、NaN、deadlock、state dtype/home device 和 route replay；
@@ -427,11 +428,12 @@ CPU expert forward/backward、256-way router、两类 attention forward/backward
 
 ### 5. 正式 sweep
 
-对两个 profile 依次跑 32、64、128、256、512、1024、2048、4096；每档执行 15
-个真实 optimizer updates，前 5 个 warmup、后 10 个计时。consumer 使用 1 TiB
-cgroup、关闭 swap并 NUMA 0/1 interleave；server 使用 8 GPU。每档单独进程启动，
-输出 canonical step records、route/placement/fast-path manifest 和
-`full_update_verification.json`，但不输出 checkpoint。
+server 依次跑 32、64、128、256、512、1024、2048、4096，consumer 依次跑
+16、32、64、128、256、512、1024、2048；每档执行 15 个真实 optimizer updates，
+前 5 个 warmup、后 10 个计时。consumer 使用 1 TiB cgroup、关闭 swap并 NUMA 0/1
+interleave；server 使用 8 GPU。每档单独进程启动，输出 canonical step records、
+route/placement/fast-path manifest 和 `full_update_verification.json`，但不输出
+checkpoint。
 
 ## 与理想 Qwen3.5 APTMoE 的 TPS 关系
 

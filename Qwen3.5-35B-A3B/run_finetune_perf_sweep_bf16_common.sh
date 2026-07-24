@@ -34,7 +34,10 @@ case "${BACKEND}" in
 esac
 
 PROFILE="server"
-SEQUENCE_LENGTHS_CSV="32,64,128,256,512,1024,2048,4096"
+readonly -a SERVER_SEQUENCE_LENGTHS=(32 64 128 256 512 1024 2048 4096)
+readonly -a CONSUMER_SEQUENCE_LENGTHS=(16 32 64 128 256 512 1024 2048)
+SEQUENCE_LENGTHS_CSV=""
+SEQUENCE_LENGTHS_OVERRIDE_SET=0
 STEPS=15
 WARMUP_STEPS=5
 GRAD_ACCUM_STEPS=1
@@ -80,7 +83,10 @@ Profiles:
       consumer : 2 GPUs, global batch 2, hard 1T cgroup cap, NUMA 0/1 interleave
 
 Sweep and training (full fine-tuning, BF16 only):
-  --seq-lengths LIST           Comma list drawn from 32,64,128,256,512,1024,2048,4096
+  --seq-lengths LIST           Override the selected profile default(s)
+                                server:   32,64,128,256,512,1024,2048,4096
+                                consumer: 16,32,64,128,256,512,1024,2048
+                                With profile=both, every override must be valid for both
   --steps N                    Optimizer steps per sequence (default: 15)
   --warmup-steps N             Initial steps excluded from stable TPS (default: 5)
   --gas N                      Gradient accumulation steps (default: 1)
@@ -147,7 +153,7 @@ need_value() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --profile) need_value "$1" "$#"; PROFILE="$2"; shift ;;
-        --seq-lengths) need_value "$1" "$#"; SEQUENCE_LENGTHS_CSV="$2"; shift ;;
+        --seq-lengths) need_value "$1" "$#"; SEQUENCE_LENGTHS_CSV="$2"; SEQUENCE_LENGTHS_OVERRIDE_SET=1; shift ;;
         --steps) need_value "$1" "$#"; STEPS="$2"; shift ;;
         --warmup-steps) need_value "$1" "$#"; WARMUP_STEPS="$2"; shift ;;
         --gas) need_value "$1" "$#"; GRAD_ACCUM_STEPS="$2"; shift ;;
@@ -243,17 +249,31 @@ if [[ "${BACKEND}" == "ktransformers" && "${KT_DISTRIBUTED_CHECKPOINT_REUSE}" ==
     KT_DISTRIBUTED_CHECKPOINT_REUSE_ENABLED=1
 fi
 
-IFS=',' read -r -a SEQUENCE_LENGTHS <<< "${SEQUENCE_LENGTHS_CSV// /}"
-(( ${#SEQUENCE_LENGTHS[@]} > 0 )) || die "--seq-lengths cannot be empty"
-declare -A SEEN_SEQUENCE=()
 MAX_SEQUENCE_LENGTH=0
-for seq in "${SEQUENCE_LENGTHS[@]}"; do
-    [[ "${seq}" =~ ^(32|64|128|256|512|1024|2048|4096)$ ]] || \
-        die "unsupported sequence length: ${seq}"
-    [[ -z "${SEEN_SEQUENCE[${seq}]:-}" ]] || die "duplicate sequence length: ${seq}"
-    SEEN_SEQUENCE["${seq}"]=1
-    (( seq > MAX_SEQUENCE_LENGTH )) && MAX_SEQUENCE_LENGTH="${seq}"
-done
+declare -a SEQUENCE_LENGTHS_OVERRIDE=()
+if [[ "${SEQUENCE_LENGTHS_OVERRIDE_SET}" -eq 1 ]]; then
+    IFS=',' read -r -a SEQUENCE_LENGTHS_OVERRIDE <<< "${SEQUENCE_LENGTHS_CSV// /}"
+    (( ${#SEQUENCE_LENGTHS_OVERRIDE[@]} > 0 )) || die "--seq-lengths cannot be empty"
+    declare -A SEEN_SEQUENCE=()
+    for seq in "${SEQUENCE_LENGTHS_OVERRIDE[@]}"; do
+        [[ "${seq}" =~ ^(16|32|64|128|256|512|1024|2048|4096)$ ]] || \
+            die "unsupported sequence length: ${seq}"
+        if [[ "${seq}" == "16" && "${PROFILE}" =~ ^(server|both)$ ]]; then
+            die "sequence length 16 is only supported by the consumer profile"
+        fi
+        if [[ "${seq}" == "4096" && "${PROFILE}" =~ ^(consumer|both)$ ]]; then
+            die "sequence length 4096 is only supported by the server profile"
+        fi
+        [[ -z "${SEEN_SEQUENCE[${seq}]:-}" ]] || die "duplicate sequence length: ${seq}"
+        SEEN_SEQUENCE["${seq}"]=1
+        (( seq > MAX_SEQUENCE_LENGTH )) && MAX_SEQUENCE_LENGTH="${seq}"
+    done
+else
+    case "${PROFILE}" in
+        server|both) MAX_SEQUENCE_LENGTH=4096 ;;
+        consumer) MAX_SEQUENCE_LENGTH=2048 ;;
+    esac
+fi
 
 _find_conda_python() {
     local env_name="$1"
@@ -983,6 +1003,14 @@ run_one_sequence() {
 
 run_profile() {
     local profile_name="$1"
+    local -a profile_sequence_lengths=()
+    if [[ "${SEQUENCE_LENGTHS_OVERRIDE_SET}" -eq 1 ]]; then
+        profile_sequence_lengths=("${SEQUENCE_LENGTHS_OVERRIDE[@]}")
+    elif [[ "${profile_name}" == "server" ]]; then
+        profile_sequence_lengths=("${SERVER_SEQUENCE_LENGTHS[@]}")
+    else
+        profile_sequence_lengths=("${CONSUMER_SEQUENCE_LENGTHS[@]}")
+    fi
     profile_parameters "${profile_name}"
     check_visible_gpu_capacity "${NUM_GPUS}"
     local devices
@@ -996,8 +1024,9 @@ run_profile() {
         log "Profile ${profile_name}: devices=${devices}, memory=${MEMORY_LIMIT_LABEL}, NUMA=${NUMA_POLICY_LABEL}, CPU threads/rank=${CPU_THREADS_PER_RANK}"
     fi
 
+    log "Profile ${profile_name} sequences: ${profile_sequence_lengths[*]}"
     local profile_status=0 seq
-    for seq in "${SEQUENCE_LENGTHS[@]}"; do
+    for seq in "${profile_sequence_lengths[@]}"; do
         if ! run_one_sequence "${profile_name}" "${profile_dir}" "${seq}" "${devices}"; then
             profile_status=1
             if [[ "${CONTINUE_ON_ERROR}" -eq 0 ]]; then
@@ -1025,7 +1054,19 @@ if [[ "${BACKEND}" == "aptmoe" ]]; then
 else
     log "Qwen3.5-35B-A3B text-only full-FT sweep: backend=${BACKEND}, precision=BF16, profile=${PROFILE}"
 fi
-log "Sequences: ${SEQUENCE_LENGTHS[*]}; steps=${STEPS}; warmup excluded=${WARMUP_STEPS}; GAS=${GRAD_ACCUM_STEPS}"
+if [[ "${SEQUENCE_LENGTHS_OVERRIDE_SET}" -eq 1 ]]; then
+    log "Sequence override: ${SEQUENCE_LENGTHS_OVERRIDE[*]}"
+else
+    case "${PROFILE}" in
+        server) log "Server sequences: ${SERVER_SEQUENCE_LENGTHS[*]}" ;;
+        consumer) log "Consumer sequences: ${CONSUMER_SEQUENCE_LENGTHS[*]}" ;;
+        both)
+            log "Server sequences: ${SERVER_SEQUENCE_LENGTHS[*]}"
+            log "Consumer sequences: ${CONSUMER_SEQUENCE_LENGTHS[*]}"
+            ;;
+    esac
+fi
+log "Steps=${STEPS}; warmup excluded=${WARMUP_STEPS}; GAS=${GRAD_ACCUM_STEPS}"
 if [[ "${BACKEND}" == "ktransformers" ]]; then
     log "Distributed checkpoint forward reuse: ${KT_DISTRIBUTED_CHECKPOINT_REUSE}"
 fi
