@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared Qwen3.5-35B-A3B text-only native-BF16 full-FT sequence sweep.
+# Shared Qwen3.5-35B-A3B text-only native-BF16 fine-tuning sequence sweep.
 # Invoke through one of the three backend-specific wrapper scripts.
 
 set -Eeuo pipefail
@@ -34,6 +34,7 @@ case "${BACKEND}" in
 esac
 
 PROFILE="server"
+FINETUNING_TYPE="full"
 readonly -a SERVER_SEQUENCE_LENGTHS=(32 64 128 256 512 1024 2048 4096)
 readonly -a CONSUMER_SEQUENCE_LENGTHS=(16 32 64 128 256 512 1024 2048)
 SEQUENCE_LENGTHS_CSV=""
@@ -42,6 +43,8 @@ STEPS=15
 WARMUP_STEPS=5
 GRAD_ACCUM_STEPS=1
 LEARNING_RATE="1.0e-5"
+LORA_RANK=8
+LORA_ALPHA=16
 DEVICES_OVERRIDE=""
 DRY_RUN=0
 CONTINUE_ON_ERROR=0
@@ -82,7 +85,11 @@ Profiles:
       server   : 8 GPUs, global batch 8, no memory cgroup cap (host ~2T)
       consumer : 2 GPUs, global batch 2, hard 1T cgroup cap, NUMA 0/1 interleave
 
-Sweep and training (full fine-tuning, BF16 only):
+Sweep and training (BF16 only):
+  --finetuning-type TYPE      full or lora (default: full)
+  --lora-rank N               LoRA rank when TYPE=lora (default: 8)
+  --lora-alpha N              LoRA alpha when TYPE=lora (default: 16)
+                                LoRA target is fixed to all
   --seq-lengths LIST           Override the selected profile default(s)
                                 server:   32,64,128,256,512,1024,2048,4096
                                 consumer: 16,32,64,128,256,512,1024,2048
@@ -153,6 +160,9 @@ need_value() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --profile) need_value "$1" "$#"; PROFILE="$2"; shift ;;
+        --finetuning-type) need_value "$1" "$#"; FINETUNING_TYPE="$2"; shift ;;
+        --lora-rank) need_value "$1" "$#"; LORA_RANK="$2"; shift ;;
+        --lora-alpha) need_value "$1" "$#"; LORA_ALPHA="$2"; shift ;;
         --seq-lengths) need_value "$1" "$#"; SEQUENCE_LENGTHS_CSV="$2"; SEQUENCE_LENGTHS_OVERRIDE_SET=1; shift ;;
         --steps) need_value "$1" "$#"; STEPS="$2"; shift ;;
         --warmup-steps) need_value "$1" "$#"; WARMUP_STEPS="$2"; shift ;;
@@ -215,6 +225,8 @@ require_positive_int "--steps" "${STEPS}"
 require_nonnegative_int "--warmup-steps" "${WARMUP_STEPS}"
 require_positive_int "--gas" "${GRAD_ACCUM_STEPS}"
 require_positive_number "--learning-rate" "${LEARNING_RATE}"
+require_positive_int "--lora-rank" "${LORA_RANK}"
+require_positive_int "--lora-alpha" "${LORA_ALPHA}"
 if [[ -n "${CPU_THREADS_OVERRIDE}" ]]; then
     require_positive_int "--cpu-threads/FFT_CPU_THREADS" "${CPU_THREADS_OVERRIDE}"
 fi
@@ -226,6 +238,18 @@ if [[ "${BACKEND}" == "aptmoe" ]] && (( WARMUP_STEPS == 0 )); then
     die "APTMoE proxy runs require at least one excluded warmup step"
 fi
 [[ "${PROFILE}" =~ ^(server|consumer|both)$ ]] || die "invalid --profile: ${PROFILE}"
+[[ "${FINETUNING_TYPE}" =~ ^(full|lora)$ ]] || \
+    die "invalid --finetuning-type: ${FINETUNING_TYPE}"
+if [[ "${BACKEND}" == "aptmoe" && "${FINETUNING_TYPE}" != "full" ]]; then
+    die "APTMoE deployment proxy supports only --finetuning-type full"
+fi
+if [[ "${FINETUNING_TYPE}" == "lora" ]]; then
+    EFFECTIVE_LORA_RANK="${LORA_RANK}"
+    EFFECTIVE_LORA_ALPHA="${LORA_ALPHA}"
+else
+    EFFECTIVE_LORA_RANK=0
+    EFFECTIVE_LORA_ALPHA=0
+fi
 [[ "${KT_DISTRIBUTED_CHECKPOINT_REUSE}" =~ ^(on|off)$ ]] || \
     die "invalid --kt-distributed-checkpoint-reuse: ${KT_DISTRIBUTED_CHECKPOINT_REUSE}"
 [[ "${CONSUMER_CGROUP_MODE}" =~ ^(auto|user|system|prelimited)$ ]] || \
@@ -583,6 +607,12 @@ make_train_config() {
     set_yaml_value "${config}" gradient_accumulation_steps "${GRAD_ACCUM_STEPS}"
     set_yaml_value "${config}" learning_rate "${LEARNING_RATE}"
     set_yaml_value "${config}" max_steps "${STEPS}"
+    set_yaml_value "${config}" finetuning_type "${FINETUNING_TYPE}"
+    set_yaml_value "${config}" lora_rank "${EFFECTIVE_LORA_RANK}"
+    if [[ "${FINETUNING_TYPE}" == "lora" ]]; then
+        set_yaml_value "${config}" lora_alpha "${EFFECTIVE_LORA_ALPHA}"
+        set_yaml_value "${config}" lora_target "all"
+    fi
     set_yaml_value "${config}" bf16 "true"
     set_yaml_value "${config}" fp16 "false"
     set_yaml_value "${config}" tf32 "false"
@@ -617,7 +647,8 @@ write_run_config() {
         "${APTMOE_ALLOW_UNPROFILED_PLACEMENT}" \
         "${APTMOE_ALLOW_LINEAR_ATTENTION_FALLBACK}" \
         "${CAPTURE_APTMOE_ROUTES}" "${APTMOE_ROOT}" \
-        "${APTMOE_ENTRYPOINT}" <<'PY'
+        "${APTMOE_ENTRYPOINT}" "${FINETUNING_TYPE}" \
+        "${EFFECTIVE_LORA_RANK}" "${EFFECTIVE_LORA_ALPHA}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -625,11 +656,14 @@ from pathlib import Path
 out = Path(sys.argv[1])
 is_proxy = sys.argv[2] == "aptmoe"
 fallback_requested = any(bool(int(value)) for value in sys.argv[28:31])
+finetuning_type = sys.argv[34]
 obj = {
     "backend": sys.argv[2],
     "profile": sys.argv[3],
     "benchmark_class": (
-        "deployment_proxy" if is_proxy else "exact_model_full_finetune"
+        "deployment_proxy"
+        if is_proxy
+        else f"exact_model_{finetuning_type}_finetune"
     ),
     "result_validity": (
         "smoke_only"
@@ -646,6 +680,10 @@ obj = {
     "checkpoint_compatible": not is_proxy,
     "llamafactory_backend": not is_proxy,
     "real_forward_backward_optimizer_update": True,
+    "finetuning_type": finetuning_type,
+    "lora_rank": int(sys.argv[35]) if finetuning_type == "lora" else 0,
+    "lora_alpha": int(sys.argv[36]) if finetuning_type == "lora" else 0,
+    "lora_target": "all" if finetuning_type == "lora" else None,
     "allow_end_to_end_qwen35_tps_claim": not is_proxy,
     "precision": "bf16",
     "modality": "text_only",
@@ -700,7 +738,7 @@ obj = {
     "result_scope": (
         "APTMoE component-isomorphic deployment throughput; no model-quality claim"
         if is_proxy
-        else "end-to-end Qwen3.5 text-model full-finetune throughput"
+        else f"end-to-end Qwen3.5 text-model {finetuning_type}-finetune throughput"
     ),
 }
 out.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -781,10 +819,13 @@ run_one_sequence() {
                 "${route_capture_env[@]}"
                 USE_KT=1
                 ACCELERATE_USE_KT=true
-                ACCELERATE_KT_TRAIN_MODE=full
-                KT_FINETUNE_MODE=full
+                ACCELERATE_KT_TRAIN_MODE="${FINETUNING_TYPE}"
+                ACCELERATE_KT_LORA_RANK="${EFFECTIVE_LORA_RANK}"
+                ACCELERATE_KT_LORA_ALPHA="${EFFECTIVE_LORA_ALPHA}"
+                KT_FINETUNE_MODE="${FINETUNING_TYPE}"
                 FFT_TRAINING_BACKEND=kt
                 FFT_PRECISION=bf16
+                FFT_FINETUNING_TYPE="${FINETUNING_TYPE}"
                 FFT_TEXT_ONLY=1
                 FFT_SKIP_FINAL_SAVE="$((1 - KEEP_MODEL_OUTPUT))"
                 FFT_STEP_TIMING_OUT_DIR="${timing_dir}"
@@ -829,9 +870,10 @@ run_one_sequence() {
                 ACCELERATE_USE_KT=false
                 FFT_TRAINING_BACKEND=deepspeed
                 FFT_PRECISION=bf16
+                FFT_FINETUNING_TYPE="${FINETUNING_TYPE}"
                 FFT_TEXT_ONLY=1
                 FFT_SKIP_FINAL_SAVE="$((1 - KEEP_MODEL_OUTPUT))"
-                KT_FINETUNE_MODE=full
+                KT_FINETUNE_MODE="${FINETUNING_TYPE}"
                 FFT_STEP_TIMING_OUT_DIR="${timing_dir}"
                 FFT_STEP_TIMING_WARMUP_STEPS="${WARMUP_STEPS}"
                 FFT_STEP_TIMING_TOKENS_PER_STEP="${tokens_per_step}"
@@ -941,7 +983,7 @@ run_one_sequence() {
     scoped_command+=(-- "${command[@]}")
     local -a full_command=("${RESOURCE_PREFIX[@]}" "${scoped_command[@]}")
     if [[ "${BACKEND}" == "ktransformers" ]]; then
-        log "${BACKEND}/${profile_name}: seq=${seq}, GPUs=${NUM_GPUS}, global_batch=${GLOBAL_BATCH_SIZE}, tokens/step=${tokens_per_step}, text-only BF16, KT owner(rank0) threads=${kt_owner_threads}, non-owner rank threads=${cpu_threads}"
+        log "${BACKEND}/${profile_name}: seq=${seq}, GPUs=${NUM_GPUS}, global_batch=${GLOBAL_BATCH_SIZE}, tokens/step=${tokens_per_step}, ${FINETUNING_TYPE}, text-only BF16, KT owner(rank0) threads=${kt_owner_threads}, non-owner rank threads=${cpu_threads}"
     elif [[ "${BACKEND}" == "aptmoe" ]]; then
         log "${BACKEND}/${profile_name}: seq=${seq}, GPUs=${NUM_GPUS}, global_batch=${GLOBAL_BATCH_SIZE}, tokens/step=${tokens_per_step}, component-isomorphic BF16 full-update proxy, CPU threads/rank=${cpu_threads}"
     else
@@ -977,7 +1019,15 @@ run_one_sequence() {
     fi
 
     if [[ "${exit_code}" -eq 0 ]]; then
-        if [[ ! -f "${timing_dir}/step_timing.json" ]]; then
+        if [[ "${FINETUNING_TYPE}" == "lora" ]] && \
+           ! grep -q "Fine-tuning method: LoRA" "${train_log}"; then
+            warn "Training exited successfully but the log does not confirm LoRA mode"
+            exit_code=95
+        elif [[ "${BACKEND}" == "ktransformers" && "${FINETUNING_TYPE}" == "lora" ]] && \
+             ! grep -Eq "Injected [1-9][0-9]* fused expert LoRA params" "${train_log}"; then
+            warn "Training exited successfully but KT fused-expert LoRA optimizer injection is missing"
+            exit_code=96
+        elif [[ ! -f "${timing_dir}/step_timing.json" ]]; then
             warn "Training exited successfully but canonical rank-0 timing is missing"
             exit_code=90
         elif ! "${VALIDATOR_PYTHON}" "${TIMING_VALIDATOR}" \
@@ -1043,7 +1093,7 @@ RUN_TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
 if [[ "${BACKEND}" == "aptmoe" ]]; then
     RUN_ROOT="${LOG_BASE}/${RUN_TIMESTAMP}_APTMOE_BF16_DEPLOYMENT_PROXY_SWEEP"
 else
-    RUN_ROOT="${LOG_BASE}/${RUN_TIMESTAMP}_${BACKEND^^}_BF16_FULL_SWEEP"
+    RUN_ROOT="${LOG_BASE}/${RUN_TIMESTAMP}_${BACKEND^^}_BF16_${FINETUNING_TYPE^^}_SWEEP"
 fi
 mkdir -p "${RUN_ROOT}"
 validate_dataset
@@ -1052,7 +1102,10 @@ if [[ "${BACKEND}" == "aptmoe" ]]; then
     log "Qwen3.5-35B-A3B component-isomorphic deployment proxy: backend=aptmoe, random BF16 weights, profile=${PROFILE}"
     log "Proxy artifacts (gitignored): ${APTMOE_SIMULATION_ROOT}"
 else
-    log "Qwen3.5-35B-A3B text-only full-FT sweep: backend=${BACKEND}, precision=BF16, profile=${PROFILE}"
+    log "Qwen3.5-35B-A3B text-only ${FINETUNING_TYPE} sweep: backend=${BACKEND}, precision=BF16, profile=${PROFILE}"
+fi
+if [[ "${FINETUNING_TYPE}" == "lora" ]]; then
+    log "LoRA parameters: rank=${EFFECTIVE_LORA_RANK}, alpha=${EFFECTIVE_LORA_ALPHA}, target=all"
 fi
 if [[ "${SEQUENCE_LENGTHS_OVERRIDE_SET}" -eq 1 ]]; then
     log "Sequence override: ${SEQUENCE_LENGTHS_OVERRIDE[*]}"

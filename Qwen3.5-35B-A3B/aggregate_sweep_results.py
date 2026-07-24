@@ -25,6 +25,10 @@ RESULT_COLUMNS = [
     "result_scope",
     "precision",
     "modality",
+    "finetuning_type",
+    "lora_rank",
+    "lora_alpha",
+    "lora_target",
     "model_load_architecture",
     "sequence_length",
     "num_gpus",
@@ -121,7 +125,10 @@ def aggregate_run(config_path: Path) -> dict[str, Any]:
     )
     benchmark_class = row["benchmark_class"]
     contract_status: str | None = None
-    if benchmark_class == "exact_model_full_finetune":
+    if benchmark_class in {
+        "exact_model_full_finetune",
+        "exact_model_lora_finetune",
+    }:
         if (
             config.get("modality") != "text_only"
             or config.get("model_load_architecture")
@@ -131,6 +138,21 @@ def aggregate_run(config_path: Path) -> dict[str, Any]:
             or config.get("llamafactory_backend") is not True
         ):
             contract_status = "MODEL_CONTRACT_MISMATCH"
+        elif (
+            benchmark_class == "exact_model_full_finetune"
+            and config.get("finetuning_type", "full") != "full"
+        ):
+            contract_status = "FINETUNING_CONTRACT_MISMATCH"
+        elif (
+            benchmark_class == "exact_model_lora_finetune"
+            and (
+                config.get("finetuning_type") != "lora"
+                or int(config.get("lora_rank") or 0) <= 0
+                or int(config.get("lora_alpha") or 0) <= 0
+                or config.get("lora_target") != "all"
+            )
+        ):
+            contract_status = "FINETUNING_CONTRACT_MISMATCH"
     elif benchmark_class == "deployment_proxy":
         manifest_path = run_dir / "proxy_manifest.json"
         verification_path = run_dir / "full_update_verification.json"
@@ -239,7 +261,7 @@ def write_markdown(path: Path, root: Path, rows: list[dict[str, Any]]) -> None:
         "- 不强制 CUDA 同步，不启用后端内部性能探针，不运行系统资源采样器，也不在 step 内写文件。",
         "- TPS 仅使用 `global_step > warmup_steps` 的稳定窗口。",
         "- exact-model run 从多模态源 checkpoint 仅加载 `Qwen3_5MoeForCausalLM`；proxy 只读取目标 config/tokenizer。",
-        "- `exact_model_full_finetune` 与 `deployment_proxy` 永久分组；后者使用随机权重，不能声明模型效果或真实 Qwen3.5 端到端训练 TPS。",
+        "- Full、LoRA exact-model 与 `deployment_proxy` 按 benchmark class 分组；proxy 使用随机权重，不能声明模型效果或真实 Qwen3.5 端到端训练 TPS。",
         "- 公式：`TPS = GPUs × per-device batch × sequence length × GAS / mean stable step seconds`。",
         "",
     ]
@@ -275,6 +297,10 @@ def write_markdown(path: Path, root: Path, rows: list[dict[str, Any]]) -> None:
                 "",
                 f"- GPU：{first.get('num_gpus')}；全局 batch：{first.get('global_batch_size')}；精度：{first.get('precision')}",
                 f"- 模态：{first.get('modality')}；加载架构：{first.get('model_load_architecture')}",
+                (
+                    f"- 微调：{first.get('finetuning_type')}；LoRA rank/alpha/target："
+                    f"{first.get('lora_rank')}/{first.get('lora_alpha')}/{first.get('lora_target')}"
+                ),
                 f"- 权重：{first.get('weight_source')}；结果有效性：{first.get('result_validity')}",
                 f"- 结果范围：{first.get('result_scope')}",
                 cpu_line,
