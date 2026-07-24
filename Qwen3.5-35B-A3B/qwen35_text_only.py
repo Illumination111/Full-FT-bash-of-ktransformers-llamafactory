@@ -213,6 +213,19 @@ def install_text_only_loading() -> None:
         )
         assert_text_only_model(model, str(finetuning_args.finetuning_type))
         _normalize_text_only_distributed_metadata(model)
+        route_output = os.environ.get("FFT_ROUTE_TRACE_DIR")
+        if route_output:
+            from qwen35_route_capture import install_route_capture
+
+            sequence_length = int(
+                os.environ.get("FFT_ROUTE_TRACE_SEQUENCE_LENGTH", "0")
+            )
+            if sequence_length <= 0:
+                raise RuntimeError(
+                    "FFT_ROUTE_TRACE_SEQUENCE_LENGTH must be positive when "
+                    "FFT_ROUTE_TRACE_DIR is set"
+                )
+            install_route_capture(model, route_output, sequence_length)
         return model
 
     loader.load_config = load_text_config

@@ -1,10 +1,12 @@
-# Qwen3.5-35B-A3B 文本-only BF16 全量微调 TPS Sweep
+# Qwen3.5-35B-A3B BF16 全量微调与 APTMoE Proxy TPS Sweep
 
-这组脚本只测试全量微调，不包含 LoRA。模型固定为本地
+这组脚本不包含 LoRA。KTransformers/DeepSpeed 测真实文本模型全量微调；
+APTMoE 测随机权重的组件同构 full-update proxy。目标配置固定为本地
 `/mnt/data3/models/Qwen3.5-35B-A3B`，训练与后端混合精度均显式设为
-BF16。默认对 `32,64,128,256,512,1024,2048,4096` 八种 sequence
-length 分别运行 15 个 optimizer steps，去除前 5 个 warmup steps 后计算
-稳定 TPS。这里的 5 步是性能统计排除窗口；训练配置的学习率 warmup 为 0。
+BF16。server 默认测试 `32,64,128,256,512,1024,2048,4096`，consumer
+默认测试 `16,32,64,128,256,512,1024,2048`。每种 sequence length 分别运行
+15 个 optimizer steps，去除前 5 个 warmup steps 后计算稳定 TPS。这里的 5 步
+是性能统计排除窗口；训练配置的学习率 warmup 为 0。
 
 ## 文本-only 模型契约
 
@@ -61,25 +63,37 @@ shell 放入有效上限恰好为 1 TiB 的 cgroup，可使用
 
 ## CPU 线程
 
-三个后端使用完全相同的线程策略和环境变量。默认每个训练 rank 使用：
+DeepSpeed 和 APTMoE 默认每个训练 rank 使用：
 
 ```text
 floor(当前进程可见物理核心数 / profile 的 GPU/rank 数)
 ```
 
-同一个数值会写入 `OMP_NUM_THREADS`、`MKL_NUM_THREADS`、
-`OPENBLAS_NUM_THREADS`、`NUMEXPR_NUM_THREADS` 和 `BLIS_NUM_THREADS`；
-KTransformers 的 `kt_num_threads` 与 `ACCELERATE_KT_OMP_NUM_THREADS` 也使用该值。
-可通过公共参数覆盖：
+KTransformers 使用 rank0 集中式 CPU MoE backend，因此不再把 96 个物理核平均
+切给所有 GPU rank。默认给每个非 owner rank 2 线程、给系统和通信辅助线程预留
+2 核，其余全部交给 rank0：
+
+```text
+server（8 卡）：rank0 80；rank1～7 各 2；计划合计 94
+consumer（2 卡）：rank0 92；rank1 2；计划合计 94
+```
+
+训练入口会在导入 PyTorch 前按 global rank 分别设置 `OMP_NUM_THREADS`、
+`MKL_NUM_THREADS`、`OPENBLAS_NUM_THREADS`、`NUMEXPR_NUM_THREADS`、
+`BLIS_NUM_THREADS` 和 `ACCELERATE_KT_OMP_NUM_THREADS`。`kt_num_threads`
+单独使用 owner 的线程数。
+
+可分别覆盖普通 rank 和 KT owner：
 
 ```bash
 bash run_finetune_perf_test_bf16_ktransformers.sh \
   --profile server \
-  --cpu-threads 12
+  --cpu-threads 2 \
+  --kt-owner-threads 80
 ```
 
-也可以设置对三个后端都生效的 `FFT_CPU_THREADS=12`。显式
-`--cpu-threads` 优先于环境变量。
+也可以使用 `FFT_CPU_THREADS=2` 和 `FFT_KT_OWNER_THREADS=80`。显式参数
+优先于对应环境变量。
 
 ## 启动
 
@@ -97,51 +111,144 @@ bash run_finetune_perf_test_bf16_ktransformers.sh --profile both --dry-run
 ```
 
 `--profile both` 按 server、consumer 顺序运行。可以通过
-`--seq-lengths 32,64` 缩小调试范围；正式对比应保留默认八档。
+`--seq-lengths 32,64` 缩小调试范围；该参数会覆盖所选 profile 的默认值，
+与 `--profile both` 一起使用时只能包含两个 profile 共有的长度。正式对比应保留
+各 profile 的默认八档。
 
-## APTMoE 适配器契约
+## APTMoE deployment proxy（已实现，非等价后端）
 
-APTMoE 官方 artifact 没有可直接用于 Qwen3.5 的通用 Hugging Face 全量训练入口，
-因此脚本不会把 simulator TPS 当成模型训练 TPS。完成 Qwen3.5 runtime 移植后，
-用下面方式接入：
+APTMoE 官方 artifact 没有 Qwen3.5 的通用 Hugging Face/LLaMA-Factory 后端。本目录
+现在提供一个独立 adapter，它导入 `/mnt/data2/wbw/APTMoE-baseline`，不修改该
+checkout：
+
+- 40 层、34,660,610,688 个参数，与 Qwen3.5 text CausalLM 的组件参数量一致；
+- GPU 使用 Transformers 的 30 个 Gated DeltaNet 和 10 个 gated full-attention；
+- CPU home 部署 40×256 个独立 6 MiB BF16 routed experts；
+- 保留 router、shared expert、248,320-way LM head、loss、backward、梯度裁剪和
+  AdamW；每 step 是真实的全参数可更新训练路径；
+- 权重由固定 seed 随机初始化，不加载 Qwen3.5 checkpoint shard，默认也不保存。
+
+所以它测的是 `APTMoE Qwen3.5 component-isomorphic deployment-proxy TPS`，不产生
+有意义的 loss、模型效果或可用 checkpoint。KTransformers、DeepSpeed 仍通过
+LLaMA-Factory 测真实 Qwen3.5；APTMoE proxy 明确记录
+`llamafactory_backend: false`，汇总器会永久分表。
+
+完整设计、参数/内存推导和误差边界见
+[`APTMOE_DEPLOYMENT_PROXY.md`](APTMOE_DEPLOYMENT_PROXY.md)。
+
+### 1. 无 GPU 参数审计
+
+```bash
+cd /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B
+
+PYTHONPATH="$PWD:/mnt/data2/wbw/APTMoE-baseline" \
+  /mnt/data2/wbw/conda/envs/Aptmoe/bin/python \
+  aptmoe_qwen35_proxy_train.py \
+  --aptmoe-root /mnt/data2/wbw/APTMoE-baseline \
+  --deployment-profile server \
+  --model-path /mnt/data3/models/Qwen3.5-35B-A3B \
+  --dataset-dir /mnt/data2/wbw/FFTtest/dataset \
+  --dataset-name fft_real_100 \
+  --output-dir /mnt/data2/wbw/FFTtest/APTMoE-simulate/audit \
+  --step-timing-output-dir /mnt/data2/wbw/FFTtest/APTMoE-simulate/audit/timing \
+  --sequence-length 32 --num-gpus 8 --global-batch-size 8 \
+  --per-device-batch-size 1 --steps 2 --warmup-steps 1 \
+  --precision bf16 --text-only --audit-only
+```
+
+### 2. 采集真实 Qwen3.5 路由
+
+在任一真实后端 sweep 上加 `--capture-aptmoe-routes`。hook 只在被排除的
+warmup forward 把 top-8 expert ID 搬到 CPU（默认 5 个 pattern，GAS>1 时相应
+增加），训练退出后自动合并各 rank：
+
+```bash
+bash run_finetune_perf_test_bf16_ktransformers.sh \
+  --profile both \
+  --capture-aptmoe-routes
+```
+
+输出为
+`APTMoE-simulate/routes/qwen35/{server,consumer}/seq_<长度>.npz`。也可在
+DeepSpeed wrapper 上执行同一参数。trace 形状为
+`[patterns, 40, global_batch×sequence, 8]`，proxy 按每个 accumulation
+microbatch 依次循环重放，覆盖多个 batch 的路由局部性和 optimizer-state
+物化。formal run 要求 pattern 数严格等于 `warmup_steps×GAS`，确保所有 route
+cache 和稀疏 state 首次触达都被排除。正式 proxy 会校验 trace 的来源、
+层数、token 数、top-k、expert 范围和重复 ID；synthetic trace 不能冒充正式结果。
+
+### 3. 在目标拓扑生成 lookup
+
+当前 `Aptmoe` 环境尚缺兼容的 `flash-linear-attention` 和 `causal-conv1d`，
+`is_fast_path_available == false`。正式 GPU attention TPS 前必须先安装兼容
+PyTorch 2.9.1/CUDA 12.8 的版本。然后分别在 server/consumer 实际 CPU
+线程、NUMA、cgroup 和 PCIe 拓扑下运行：
+
+```bash
+export CUDA_CACHE_PATH=/mnt/data2/wbw/FFTtest/APTMoE-simulate/cache/cuda
+export TORCH_EXTENSIONS_DIR=/mnt/data2/wbw/FFTtest/APTMoE-simulate/cache/torch_extensions
+export TRITON_CACHE_DIR=/mnt/data2/wbw/FFTtest/APTMoE-simulate/cache/triton
+
+/mnt/data2/wbw/conda/envs/Aptmoe/bin/python \
+  profile_aptmoe_qwen35_proxy.py \
+  --deployment-profile server \
+  --model-path /mnt/data3/models/Qwen3.5-35B-A3B \
+  --output /mnt/data2/wbw/FFTtest/APTMoE-simulate/lookups/qwen35/server.json \
+  --simulation-root /mnt/data2/wbw/FFTtest/APTMoE-simulate \
+  --sequence-length 128 --max-tokens 32768 --cpu-threads 12
+
+/mnt/data2/wbw/conda/envs/Aptmoe/bin/python \
+  profile_aptmoe_qwen35_proxy.py \
+  --deployment-profile consumer \
+  --model-path /mnt/data3/models/Qwen3.5-35B-A3B \
+  --output /mnt/data2/wbw/FFTtest/APTMoE-simulate/lookups/qwen35/consumer.json \
+  --simulation-root /mnt/data2/wbw/FFTtest/APTMoE-simulate \
+  --sequence-length 128 --max-tokens 4096 --cpu-threads 48
+```
+
+lookup 覆盖 6 MiB expert H2D/D2H、CPU expert forward/backward 曲线、
+256-way router、两种 Qwen3.5 token mixer，以及首尾 stage 的
+embedding/final-norm/LM-head 搬运。不能复用 Qwen3-30B 的 9 MiB 表。
+`max-tokens` 必须至少覆盖该 profile 最大的 `global_batch×sequence`；不足时正式
+runner 会在模型分配前拒绝 lookup，而不会静默 clamp。
+
+### 4. Smoke 与正式运行
+
+仅验证 pipeline/参数路径时，必须显式打开全部 smoke fallback：
 
 ```bash
 bash run_finetune_perf_test_bf16_aptmoe.sh \
-  --profile server \
-  --aptmoe-python /path/to/aptmoe-env/bin/python \
-  --aptmoe-entrypoint /path/to/qwen35_aptmoe_bf16_adapter.py
+  --profile consumer \
+  --seq-lengths 16 \
+  --steps 4 --warmup-steps 2 \
+  --aptmoe-allow-synthetic-routing \
+  --aptmoe-allow-unprofiled-placement \
+  --aptmoe-allow-linear-attention-fallback
 ```
 
-适配器必须接受公共脚本传入的这些参数：
+这类结果固定标为 `SMOKE_ONLY`。真实路由、profile lookup 和 linear-attention
+fast path 都准备好后，正式命令不带任何 fallback：
 
-```text
---model-path --dataset-dir --dataset-name --output-dir
---step-timing-output-dir --sequence-length --num-gpus
---global-batch-size --per-device-batch-size
---gradient-accumulation-steps --steps --warmup-steps
---learning-rate --precision
---text-only
+```bash
+bash run_finetune_perf_test_bf16_aptmoe.sh --profile server
+bash run_finetune_perf_test_bf16_aptmoe.sh --profile consumer
 ```
 
-它必须把多模态源 checkpoint 加载为 `Qwen3_5MoeForCausalLM`，不得创建视觉塔或
-processor，并执行真实 Qwen3.5-35B-A3B 文本模型 BF16 全量 forward、backward 和
-optimizer update。`--text-only` 是强制标志。适配器还必须遵守与另外两个后端相同
-的无探针计时规则。在
-`--step-timing-output-dir/step_timing.json` 中至少写出：
+默认使用 `/mnt/data2/wbw/conda/envs/Aptmoe` 和
+`/mnt/data2/wbw/APTMoE-baseline`，均可通过 `--aptmoe-python`、
+`--aptmoe-root` 覆盖。正式运行若缺 route、lookup 或 fast path，会在大规模参数
+分配前终止。
 
-- `timing_mode: coarse_host_wall_no_cuda_sync`；
-- 四个 `instrumentation` 标志均为 `false`；
-- 每个 step 的 `forward_sec`、`backward_sec`、`optimizer_sec`、
-  `step_total_sec`；
-- `num_stable_steps`、`aggregate_stable` 和
-  `tps_attribution.stable_tps`。
-
-APTMoE 进程会收到和其他后端相同的 CPU 线程环境变量，以及
-`FFT_DISABLE_PERF_PROBES=1`。
+随机参数只在 RAM 中构造。仅当显式传入 `--keep-model-output` 时，才按 rank 写出
+约 64.56 GiB 的 model-only 随机权重；路径固定在
+`/mnt/data2/wbw/FFTtest/APTMoE-simulate/random_weights/`。整个
+`APTMoE-simulate/` 已被 Git 忽略。不要对 8 个长度和两个 profile 全量保存，
+16 份约 1,032.97 GiB，超过当前约 776 GiB 可用空间。
 
 ## 结果
 
-每次启动在 `test_log/<timestamp>_<backend>_BF16_FULL_SWEEP/` 下生成：
+真实后端写入 `test_log/<timestamp>_<backend>_BF16_FULL_SWEEP/`；APTMoE 写入
+`test_log/<timestamp>_APTMOE_BF16_DEPLOYMENT_PROXY_SWEEP/`。其中：
 
 - 每个 sequence 的训练配置、完整日志和 `step_timing.json/csv/md`；
 - `sweep_results.csv`：稳定 TPS，以及 forward、backward、optimizer 平均耗时；
@@ -150,10 +257,14 @@ APTMoE 进程会收到和其他后端相同的 CPU 线程环境变量，以及
 - `run_config.json`：源架构、文本加载架构以及 `text_only` 模态契约；
 - 每个 sequence 的 `resource_contract.json`：训练开始前实际生效的 cgroup、swap
   和 NUMA policy。它不是运行期资源采样结果。
+- APTMoE 另写 `proxy_manifest.json` 和 `full_update_verification.json`，记录精确
+  参数分类、路由/placement/fast-path 来源、optimizer scope、梯度、权重变化以及
+  BF16 moment 的 CPU home device。
 
 默认跳过 LLaMA-Factory 在训练结束后的完整模型保存，避免每个 sequence 重复写出
-几十 GB 权重；它不属于 optimizer-step TPS 窗口。需要保留最终权重时显式传入
-`--keep-model-output`。
+几十 GB 权重；它不属于 optimizer-step TPS 窗口。APTMoE 同样默认不保存随机权重。
+需要保留时显式传入 `--keep-model-output`；APTMoE 只允许写入 Git-ignored 的
+`APTMoE-simulate/random_weights/`。
 
 TPS 公式为：
 

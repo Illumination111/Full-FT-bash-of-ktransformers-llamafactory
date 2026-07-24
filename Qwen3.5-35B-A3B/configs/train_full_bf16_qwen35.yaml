@@ -53,6 +53,11 @@ bf16: true
 fp16: false
 tf32: false
 gradient_checkpointing: true
+# Trainer calls gradient_checkpointing_enable() a second time.  Pin the
+# non-reentrant implementation here so that call does not restore LLaMA-Factory's
+# reentrant default; KTransformers checkpoint-forward reuse depends on the
+# non-reentrant saved-tensor hook phases.
+gradient_checkpointing_kwargs: {use_reentrant: false}
 ddp_timeout: 360000000
 resume_from_checkpoint: null
 max_grad_norm: 1.0
