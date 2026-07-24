@@ -40,9 +40,21 @@ bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_ktransfo
   --dataset-dir /mnt/data2/wbw/FFTtest/dataset \
   --dataset-name fft_real_100 \
   --log-base /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/test_log \
+  --kt-distributed-checkpoint-reuse on \
   --consumer-cgroup-mode auto \
   --continue-on-error
 ```
+
+`--kt-distributed-checkpoint-reuse on` 使多卡 gradient-checkpoint 重算阶段复用第一次
+forward 已生成的 CPU routed-expert 缓存。GPU attention、router 等非 CPU MoE 部分仍按
+checkpoint 语义正常重算。该开关仅作用于 KTransformers，且默认值就是 `on`；命令中显式
+写出是为了让性能测试条件清晰可复现。
+
+KTransformers 和 DeepSpeed 生成的 LLaMA-Factory 配置都固定使用非重入式 checkpoint：
+`gradient_checkpointing_kwargs: {use_reentrant: false}`。这也避免 Transformers `Trainer`
+的二次初始化把 KTransformers 所需的非重入式 checkpoint 静默改回 LLaMA-Factory 的
+reentrant 默认值。APTMoE 使用外部 adapter；做三后端严格对比时，该 adapter 也应采用
+等价的非重入式 checkpoint 设置。
 
 ### DeepSpeed：一条命令跑完整测试
 
@@ -106,12 +118,14 @@ APTMoE adapter 必须接受脚本传入的 `--text-only`，并保证只构造
 # KTransformers server：8 卡、约 2T 内存
 bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_ktransformers.sh \
   --profile server \
-  --devices 0,1,2,3,4,5,6,7
+  --devices 0,1,2,3,4,5,6,7 \
+  --kt-distributed-checkpoint-reuse on
 
 # KTransformers consumer：2 卡、1 TiB 内存
 bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_ktransformers.sh \
   --profile consumer \
-  --devices 0,1
+  --devices 0,1 \
+  --kt-distributed-checkpoint-reuse on
 
 # DeepSpeed server
 bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_deepspeed.sh \
@@ -195,6 +209,7 @@ bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_ktransfo
 | `--dataset-dir` | `FFTtest/dataset` | LLaMA-Factory 数据集目录 |
 | `--dataset-name` | `fft_real_100` | `dataset_info.json` 中的数据集名称 |
 | `--log-base` | 当前目录下 `test_log` | 测试结果根目录 |
+| `--kt-distributed-checkpoint-reuse` | `on` | KTransformers 多卡 checkpoint 重算复用第一次 CPU MoE forward；可设为 `off` 做 A/B 对照 |
 | `--continue-on-error` | 关闭 | 某个长度失败后继续后续测试 |
 | `--keep-model-output` | 关闭 | 保留最终模型；默认跳过完整权重保存 |
 | `--skip-dataset-check` | 关闭 | 跳过 tokenizer 长度校验 |
@@ -224,6 +239,25 @@ bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_deepspee
 ```
 
 这里 `--warmup-steps` 只控制 TPS 统计排除窗口；学习率 warmup 固定为 0。
+
+也可以通过环境变量设置同一开关；显式命令行参数优先：
+
+```bash
+FFT_KT_DISTRIBUTED_CHECKPOINT_REUSE=off \
+  bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_ktransformers.sh \
+  --profile server
+```
+
+每个 sequence 的 `run_config.json` 会记录
+`kt_distributed_checkpoint_forward_reuse: true/false`。开启后，训练日志应包含：
+
+```text
+Checkpoint forward reuse: enabled=True, distributed_opt_in=True, world_size=2
+Distributed checkpoint forward reuse active: layer=0, world_size=2
+```
+
+server 模式对应的 `world_size` 应为 `8`。第一行表示各 rank 对开关达成一致，第二行
+表示 checkpoint 的第二次 forward 已实际进入缓存复用分支，而不仅是配置已开启。
 
 ## 4. GPU 选择
 
@@ -264,18 +298,24 @@ FFT_CONDA_ENV=Deepspeed \
 bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_deepspeed.sh --profile server
 ```
 
-三个后端使用同一个线程算法和同一个公共参数。默认值为
-`floor(当前进程可见物理核心数 / profile 的 GPU/rank 数)`，从而让三后端的总
-OMP 线程预算一致。同一值会写入 `OMP_NUM_THREADS`、`MKL_NUM_THREADS`、
-`OPENBLAS_NUM_THREADS`、`NUMEXPR_NUM_THREADS`、`BLIS_NUM_THREADS`；
-KTransformers 的 `kt_num_threads` 和 `ACCELERATE_KT_OMP_NUM_THREADS` 也使用该值。
+DeepSpeed 和 APTMoE 默认使用
+`floor(当前进程可见物理核心数 / profile 的 GPU/rank 数)`。KTransformers
+只有 global rank0 创建 CPU MoE backend，因此改为 rank-aware 分配：非 owner
+rank 各 2 线程，预留 2 个物理核，其余核心交给 rank0。在当前 96 核主机上，
+8 卡为 `80 + 7 × 2 = 94`，双卡为 `92 + 1 × 2 = 94`。
+
+训练入口会按 global rank 设置 `OMP_NUM_THREADS`、`MKL_NUM_THREADS`、
+`OPENBLAS_NUM_THREADS`、`NUMEXPR_NUM_THREADS`、`BLIS_NUM_THREADS` 和
+`ACCELERATE_KT_OMP_NUM_THREADS`；生成的 Accelerate 配置同时把
+`kt_num_threads` 设置为 owner 线程数。
 
 命令行覆盖方式：
 
 ```bash
 bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_ktransformers.sh \
   --profile server \
-  --cpu-threads 12
+  --cpu-threads 2 \
+  --kt-owner-threads 80
 ```
 
 也可以用同一个环境变量控制任意后端：
@@ -285,7 +325,8 @@ FFT_CPU_THREADS=12 \
 bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_deepspeed.sh --profile server
 ```
 
-显式 `--cpu-threads` 优先于 `FFT_CPU_THREADS`。旧的后端专用
+显式 `--cpu-threads` 优先于 `FFT_CPU_THREADS`；`--kt-owner-threads` 优先于
+`FFT_KT_OWNER_THREADS`。旧的后端专用
 `FFT_OMP_NUM_THREADS`、`FFT_DS_OMP_NUM_THREADS` 和
 `FFT_APTMOE_OMP_NUM_THREADS` 不再使用。
 

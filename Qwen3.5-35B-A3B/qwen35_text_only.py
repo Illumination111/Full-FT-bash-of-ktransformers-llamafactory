@@ -62,19 +62,38 @@ def assert_text_only_model(model: "PreTrainedModel", finetuning_type: str) -> No
     """Fail before optimizer construction if any multimodal component survived."""
     import torch
 
-    model_type = getattr(model.config, "model_type", None)
-    architectures = list(getattr(model.config, "architectures", None) or [])
+    if finetuning_type not in {"full", "lora"}:
+        raise RuntimeError(
+            "This benchmark supports only full or LoRA fine-tuning, "
+            f"got {finetuning_type!r}."
+        )
+
+    get_base_model = getattr(model, "get_base_model", None)
+    base_model = get_base_model() if callable(get_base_model) else model
+    is_adapter_wrapped = base_model is not model
+    if finetuning_type == "full" and is_adapter_wrapped:
+        raise RuntimeError(
+            "Full fine-tuning unexpectedly constructed an adapter-wrapped model: "
+            f"{type(model).__name__}."
+        )
+    if finetuning_type == "lora" and not is_adapter_wrapped:
+        raise RuntimeError(
+            "LoRA fine-tuning did not construct an adapter-wrapped model; "
+            f"got {type(model).__name__}."
+        )
+
+    model_type = getattr(base_model.config, "model_type", None)
+    architectures = list(getattr(base_model.config, "architectures", None) or [])
     if model_type != TEXT_MODEL_TYPE or architectures != [TEXT_ARCHITECTURE]:
         raise RuntimeError(
             "Text-only model contract failed: "
             f"model_type={model_type!r}, architectures={architectures!r}."
         )
-    if type(model).__name__ != TEXT_ARCHITECTURE:
+    if type(base_model).__name__ != TEXT_ARCHITECTURE:
         raise RuntimeError(
-            f"Expected {TEXT_ARCHITECTURE}, but Transformers constructed {type(model).__name__}."
+            f"Expected {TEXT_ARCHITECTURE}, but Transformers constructed "
+            f"{type(base_model).__name__} inside {type(model).__name__}."
         )
-    if finetuning_type != "full":
-        raise RuntimeError(f"This benchmark is full fine-tuning only, got {finetuning_type!r}.")
 
     conv3d_modules = [name for name, module in model.named_modules() if isinstance(module, torch.nn.Conv3d)]
     if conv3d_modules:
@@ -100,7 +119,8 @@ def assert_text_only_model(model: "PreTrainedModel", finetuning_type: str) -> No
     total = sum(parameter.numel() for parameter in model.parameters())
     _rank0_print(
         "[qwen35_text_only] contract=OK "
-        f"class={type(model).__name__} model_type={model_type} "
+        f"class={type(model).__name__} base_class={type(base_model).__name__} "
+        f"finetuning_type={finetuning_type} model_type={model_type} "
         f"conv3d=0 multimodal_params=0 trainable={trainable} total={total}"
     )
 
@@ -115,7 +135,13 @@ def _normalize_text_only_distributed_metadata(model: "PreTrainedModel") -> None:
             f"Text-only model does not contain the FSDP wrap class {TEXT_FSDP_LAYER_CLASS}."
         )
 
-    metadata_owners = [model, getattr(model, "model", None)]
+    get_base_model = getattr(model, "get_base_model", None)
+    base_model = get_base_model() if callable(get_base_model) else model
+    metadata_owners = [
+        model,
+        base_model,
+        getattr(base_model, "model", None),
+    ]
     for owner in metadata_owners:
         if owner is not None:
             owner._no_split_modules = [TEXT_FSDP_LAYER_CLASS]
